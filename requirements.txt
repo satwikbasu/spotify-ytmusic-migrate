@@ -1,0 +1,26 @@
+# UI framework (Flutter-based Python desktop UI)
+flet>=0.20.0
+
+# Official Spotify API wrapper
+spotipy>=2.23.0
+
+# YouTube Music API wrapper (uses internal web API)
+ytmusicapi>=1.4.0
+
+# Google OAuth2 implementation
+google-auth-oauthlib>=1.2.0
+
+# Fast fuzzy string matching
+rapidfuzz>=3.5.0
+
+# Cross-platform desktop notifications
+plyer>=2.1.0
+
+# Testing framework
+pytest>=7.4.0
+
+# Code coverage for tests
+pytest-cov>=4.1.0
+
+# Token encryption at rest
+cryptography>=41.0.0
