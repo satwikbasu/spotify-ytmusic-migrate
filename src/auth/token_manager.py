@@ -1,0 +1,455 @@
+"""Token Manager Module.
+
+This module provides a unified token management system that combines authentication
+and encryption for both Spotify and YouTube Music services.
+"""
+
+import os
+import logging
+from typing import Optional
+import shutil
+
+import spotipy
+from ytmusicapi import YTMusic
+
+from ..auth.spotify_auth import SpotifyAuthenticator
+from ..auth.youtube_auth import YouTubeAuthenticator
+from ..utils.encryption import (
+    ensure_master_key,
+    encrypt_json_file,
+    decrypt_json_file,
+    load_key
+)
+
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+
+class TokenManager:
+    """Unified token management system with authentication and encryption.
+    
+    This class manages OAuth tokens for both Spotify and YouTube Music,
+    providing encrypted storage and automatic token lifecycle management.
+    
+    Token Storage:
+    - Encrypted tokens are stored in ~/.playlist_migrator/tokens/
+    - Spotify: .spotify_cache.enc
+    - YouTube Music: youtube_oauth.json.enc
+    - Encryption key: ~/.playlist_migrator/master.key
+    
+    Attributes:
+        spotify_auth (SpotifyAuthenticator): Spotify authentication handler.
+        youtube_auth (YouTubeAuthenticator): YouTube Music authentication handler.
+        encryption_key (bytes): Master encryption key for token storage.
+        tokens_dir (str): Directory where encrypted tokens are stored.
+    """
+    
+    TOKENS_DIR = os.path.expanduser("~/.playlist_migrator/tokens")
+    MASTER_KEY_PATH = os.path.expanduser("~/.playlist_migrator/master.key")
+    
+    SPOTIFY_CACHE_NAME = ".spotify_cache"
+    YOUTUBE_CACHE_NAME = "youtube_oauth.json"
+    
+    def __init__(
+        self,
+        spotify_client_id: str,
+        spotify_client_secret: str,
+        youtube_client_id: str,
+        youtube_client_secret: str
+    ):
+        """Initialize the Token Manager with client credentials.
+        
+        Sets up authenticators for both services and ensures the encryption
+        infrastructure is in place.
+        
+        Args:
+            spotify_client_id (str): Spotify application client ID.
+            spotify_client_secret (str): Spotify application client secret.
+            youtube_client_id (str): Google OAuth client ID for YouTube.
+            youtube_client_secret (str): Google OAuth client secret for YouTube.
+            
+        Raises:
+            ValueError: If any credentials are empty or None.
+            OSError: If token directory cannot be created.
+        """
+        # Validate inputs
+        if not all([spotify_client_id, spotify_client_secret, 
+                   youtube_client_id, youtube_client_secret]):
+            raise ValueError("All client credentials are required")
+        
+        logger.info("Initializing TokenManager")
+        
+        # Initialize authenticators
+        self.spotify_auth = SpotifyAuthenticator(
+            client_id=spotify_client_id,
+            client_secret=spotify_client_secret
+        )
+        
+        self.youtube_auth = YouTubeAuthenticator(
+            client_id=youtube_client_id,
+            client_secret=youtube_client_secret
+        )
+        
+        # Ensure tokens directory exists
+        try:
+            if not os.path.exists(self.TOKENS_DIR):
+                os.makedirs(self.TOKENS_DIR, mode=0o700)
+                logger.info(f"Created tokens directory: {self.TOKENS_DIR}")
+        except OSError as e:
+            logger.error(f"Failed to create tokens directory: {str(e)}")
+            raise OSError(f"Cannot create tokens directory: {str(e)}") from e
+        
+        # Load or generate encryption key
+        try:
+            self.encryption_key = ensure_master_key(self.MASTER_KEY_PATH)
+            logger.info("Encryption key loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load encryption key: {str(e)}")
+            raise RuntimeError(f"Encryption key initialization failed: {str(e)}") from e
+        
+        self.tokens_dir = self.TOKENS_DIR
+    
+    def _get_encrypted_path(self, cache_name: str) -> str:
+        """Get the path for an encrypted token file.
+        
+        Args:
+            cache_name (str): Name of the cache file.
+            
+        Returns:
+            str: Full path to the encrypted token file.
+        """
+        return os.path.join(self.tokens_dir, f"{cache_name}.enc")
+    
+    def _encrypt_token_file(self, source_path: str, cache_name: str) -> None:
+        """Encrypt a token file and move it to the tokens directory.
+        
+        Args:
+            source_path (str): Path to the original unencrypted token file.
+            cache_name (str): Base name for the encrypted cache file.
+            
+        Raises:
+            FileNotFoundError: If source file doesn't exist.
+            IOError: If encryption or file operations fail.
+        """
+        expanded_source = os.path.expanduser(source_path)
+        
+        if not os.path.exists(expanded_source):
+            raise FileNotFoundError(f"Token file not found: {expanded_source}")
+        
+        try:
+            # Encrypt the file (this also deletes the original)
+            encrypt_json_file(expanded_source, self.encryption_key)
+            
+            # Move encrypted file to tokens directory
+            encrypted_source = f"{expanded_source}.enc"
+            encrypted_dest = self._get_encrypted_path(cache_name)
+            
+            # Only move if source and destination are different
+            if encrypted_source != encrypted_dest:
+                if os.path.exists(encrypted_dest):
+                    os.remove(encrypted_dest)
+                
+                shutil.move(encrypted_source, encrypted_dest)
+                logger.info(f"Token encrypted and moved to: {encrypted_dest}")
+            else:
+                logger.info(f"Token encrypted: {encrypted_dest}")
+            
+        except Exception as e:
+            logger.error(f"Failed to encrypt token file: {str(e)}")
+            raise IOError(f"Token encryption failed: {str(e)}") from e
+    
+    def _decrypt_to_temp(self, cache_name: str) -> str:
+        """Decrypt a token file to a temporary location.
+        
+        Args:
+            cache_name (str): Base name of the cache file.
+            
+        Returns:
+            str: Path to the decrypted temporary file.
+            
+        Raises:
+            FileNotFoundError: If encrypted file doesn't exist.
+            IOError: If decryption fails.
+        """
+        encrypted_path = self._get_encrypted_path(cache_name)
+        
+        if not os.path.exists(encrypted_path):
+            raise FileNotFoundError(f"Encrypted token not found: {encrypted_path}")
+        
+        try:
+            # Decrypt the JSON data
+            decrypted_data = decrypt_json_file(encrypted_path, self.encryption_key)
+            
+            # Write to temporary file in home directory
+            temp_path = os.path.expanduser(f"~/{cache_name}")
+            
+            import json
+            with open(temp_path, 'w') as f:
+                json.dump(decrypted_data, f, indent=2)
+            
+            logger.debug(f"Token decrypted to temporary file: {temp_path}")
+            return temp_path
+            
+        except Exception as e:
+            logger.error(f"Failed to decrypt token file: {str(e)}")
+            raise IOError(f"Token decryption failed: {str(e)}") from e
+    
+    def authenticate_spotify(self) -> spotipy.Spotify:
+        """Authenticate with Spotify and encrypt the token.
+        
+        Performs the OAuth flow for Spotify authentication, then encrypts
+        the resulting token file for secure storage.
+        
+        Returns:
+            spotipy.Spotify: Authenticated Spotify client.
+            
+        Raises:
+            RuntimeError: If authentication fails.
+            IOError: If token encryption fails.
+        """
+        logger.info("Starting Spotify authentication")
+        
+        try:
+            # Perform authentication
+            sp_client = self.spotify_auth.authenticate()
+            logger.info("Spotify authentication successful")
+            
+            # Encrypt the cache file
+            cache_path = self.spotify_auth.cache_path
+            
+            if os.path.exists(cache_path):
+                self._encrypt_token_file(cache_path, self.SPOTIFY_CACHE_NAME)
+                logger.info("Spotify token encrypted and stored")
+            else:
+                logger.warning("Spotify cache file not found after authentication")
+            
+            return sp_client
+            
+        except Exception as e:
+            logger.error(f"Spotify authentication failed: {str(e)}")
+            raise RuntimeError(f"Spotify authentication failed: {str(e)}") from e
+    
+    def authenticate_youtube(self) -> YTMusic:
+        """Authenticate with YouTube Music and encrypt the token.
+        
+        Performs the OAuth flow for YouTube Music authentication, then encrypts
+        the resulting token file for secure storage.
+        
+        Returns:
+            YTMusic: Authenticated YouTube Music client.
+            
+        Raises:
+            RuntimeError: If authentication fails.
+            IOError: If token encryption fails.
+        """
+        logger.info("Starting YouTube Music authentication")
+        
+        try:
+            # Perform authentication
+            yt_client = self.youtube_auth.authenticate()
+            logger.info("YouTube Music authentication successful")
+            
+            # Encrypt the credentials file
+            creds_path = self.youtube_auth.credentials_path
+            
+            if os.path.exists(creds_path):
+                self._encrypt_token_file(creds_path, self.YOUTUBE_CACHE_NAME)
+                logger.info("YouTube Music token encrypted and stored")
+            else:
+                logger.warning("YouTube credentials file not found after authentication")
+            
+            return yt_client
+            
+        except Exception as e:
+            logger.error(f"YouTube Music authentication failed: {str(e)}")
+            raise RuntimeError(f"YouTube Music authentication failed: {str(e)}") from e
+    
+    def get_spotify_client(self) -> Optional[spotipy.Spotify]:
+        """Get an authenticated Spotify client from cached encrypted credentials.
+        
+        Attempts to load and decrypt cached Spotify credentials, then creates
+        an authenticated client. Returns None if no valid credentials exist.
+        
+        Returns:
+            Optional[spotipy.Spotify]: Authenticated Spotify client, or None if
+                no valid cached credentials exist.
+        """
+        logger.debug("Attempting to load cached Spotify credentials")
+        
+        try:
+            # Check if encrypted token exists
+            if not self.is_spotify_authenticated():
+                logger.debug("No cached Spotify credentials found")
+                return None
+            
+            # Decrypt token to temporary location
+            temp_cache = self._decrypt_to_temp(self.SPOTIFY_CACHE_NAME)
+            
+            try:
+                # Update the authenticator's cache path to use decrypted file
+                original_cache_path = self.spotify_auth.cache_path
+                self.spotify_auth.cache_path = temp_cache
+                
+                # Create authenticated client
+                sp_client = spotipy.Spotify(auth_manager=self.spotify_auth._get_oauth_manager())
+                
+                # Test the connection
+                sp_client.current_user()
+                logger.info("Spotify client created from cached credentials")
+                
+                return sp_client
+                
+            finally:
+                # Restore original cache path
+                self.spotify_auth.cache_path = original_cache_path
+                
+                # Clean up temporary file
+                if os.path.exists(temp_cache):
+                    os.remove(temp_cache)
+                    logger.debug("Temporary Spotify cache file removed")
+            
+        except Exception as e:
+            logger.error(f"Failed to load cached Spotify credentials: {str(e)}")
+            return None
+    
+    def get_youtube_client(self) -> Optional[YTMusic]:
+        """Get an authenticated YouTube Music client from cached encrypted credentials.
+        
+        Attempts to load and decrypt cached YouTube Music credentials, then creates
+        an authenticated client. Returns None if no valid credentials exist.
+        
+        Returns:
+            Optional[YTMusic]: Authenticated YouTube Music client, or None if
+                no valid cached credentials exist.
+        """
+        logger.debug("Attempting to load cached YouTube Music credentials")
+        
+        try:
+            # Check if encrypted token exists
+            if not self.is_youtube_authenticated():
+                logger.debug("No cached YouTube Music credentials found")
+                return None
+            
+            # Decrypt token to temporary location
+            temp_creds = self._decrypt_to_temp(self.YOUTUBE_CACHE_NAME)
+            
+            try:
+                # Create authenticated client
+                yt_client = YTMusic(auth=temp_creds)
+                
+                # Test the connection
+                yt_client.get_account_info()
+                logger.info("YouTube Music client created from cached credentials")
+                
+                return yt_client
+                
+            finally:
+                # Clean up temporary file
+                if os.path.exists(temp_creds):
+                    os.remove(temp_creds)
+                    logger.debug("Temporary YouTube credentials file removed")
+            
+        except Exception as e:
+            logger.error(f"Failed to load cached YouTube Music credentials: {str(e)}")
+            return None
+    
+    def is_spotify_authenticated(self) -> bool:
+        """Check if encrypted Spotify credentials exist.
+        
+        Returns:
+            bool: True if encrypted Spotify credentials exist, False otherwise.
+        """
+        encrypted_path = self._get_encrypted_path(self.SPOTIFY_CACHE_NAME)
+        exists = os.path.exists(encrypted_path)
+        logger.debug(f"Spotify authenticated: {exists}")
+        return exists
+    
+    def is_youtube_authenticated(self) -> bool:
+        """Check if encrypted YouTube Music credentials exist.
+        
+        Returns:
+            bool: True if encrypted YouTube Music credentials exist, False otherwise.
+        """
+        encrypted_path = self._get_encrypted_path(self.YOUTUBE_CACHE_NAME)
+        exists = os.path.exists(encrypted_path)
+        logger.debug(f"YouTube Music authenticated: {exists}")
+        return exists
+    
+    def clear_all_tokens(self) -> None:
+        """Remove all cached tokens and encrypted files.
+        
+        Deletes all encrypted token files and clears the authentication cache
+        for both Spotify and YouTube Music. This requires users to re-authenticate
+        on their next use.
+        
+        Note:
+            This method does not delete the master encryption key.
+        """
+        logger.info("Clearing all cached tokens")
+        
+        # Clear Spotify tokens
+        try:
+            spotify_enc = self._get_encrypted_path(self.SPOTIFY_CACHE_NAME)
+            if os.path.exists(spotify_enc):
+                os.remove(spotify_enc)
+                logger.info(f"Removed encrypted Spotify token: {spotify_enc}")
+            
+            # Also clear any unencrypted cache
+            self.spotify_auth.clear_cache()
+            
+        except Exception as e:
+            logger.warning(f"Failed to clear Spotify tokens: {str(e)}")
+        
+        # Clear YouTube Music tokens
+        try:
+            youtube_enc = self._get_encrypted_path(self.YOUTUBE_CACHE_NAME)
+            if os.path.exists(youtube_enc):
+                os.remove(youtube_enc)
+                logger.info(f"Removed encrypted YouTube token: {youtube_enc}")
+            
+            # Also clear any unencrypted cache
+            self.youtube_auth.clear_cache()
+            
+        except Exception as e:
+            logger.warning(f"Failed to clear YouTube Music tokens: {str(e)}")
+        
+        logger.info("All tokens cleared successfully")
+    
+    def clear_spotify_token(self) -> None:
+        """Remove only Spotify cached tokens.
+        
+        Deletes the encrypted Spotify token file and clears the authentication cache.
+        """
+        logger.info("Clearing Spotify token")
+        
+        try:
+            spotify_enc = self._get_encrypted_path(self.SPOTIFY_CACHE_NAME)
+            if os.path.exists(spotify_enc):
+                os.remove(spotify_enc)
+                logger.info("Spotify token cleared")
+            
+            self.spotify_auth.clear_cache()
+            
+        except Exception as e:
+            logger.error(f"Failed to clear Spotify token: {str(e)}")
+            raise IOError(f"Failed to clear Spotify token: {str(e)}") from e
+    
+    def clear_youtube_token(self) -> None:
+        """Remove only YouTube Music cached tokens.
+        
+        Deletes the encrypted YouTube Music token file and clears the authentication cache.
+        """
+        logger.info("Clearing YouTube Music token")
+        
+        try:
+            youtube_enc = self._get_encrypted_path(self.YOUTUBE_CACHE_NAME)
+            if os.path.exists(youtube_enc):
+                os.remove(youtube_enc)
+                logger.info("YouTube Music token cleared")
+            
+            self.youtube_auth.clear_cache()
+            
+        except Exception as e:
+            logger.error(f"Failed to clear YouTube Music token: {str(e)}")
+            raise IOError(f"Failed to clear YouTube Music token: {str(e)}") from e
