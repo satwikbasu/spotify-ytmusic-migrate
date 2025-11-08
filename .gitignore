@@ -216,3 +216,6 @@ logs/
 *.temp
 *.bak
 *.backup
+
+# Project specification
+spec.md
