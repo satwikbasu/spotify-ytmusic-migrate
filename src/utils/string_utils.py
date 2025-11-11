@@ -63,17 +63,27 @@ def normalize_string(text: str) -> str:
     # Convert to lowercase
     text = text.lower()
     
+    # Normalize whitespace first (convert tabs, newlines to spaces)
+    text = re.sub(r'\s+', ' ', text)
+    
     # Remove accents using Unicode normalization
     # NFD = Canonical Decomposition (separates base character from accent)
     # Then filter out combining characters (accents, diacritics)
     text = unicodedata.normalize('NFD', text)
     text = ''.join(char for char in text if unicodedata.category(char) != 'Mn')
     
+    # Remove emojis and other symbols
+    # Filter out emoji characters (category 'So') and other non-text symbols
+    # Keep letters (L*), numbers (N*), spaces (Z*), and punctuation (P*)
+    text = ''.join(
+        char for char in text 
+        if unicodedata.category(char)[0] in ('L', 'N', 'Z', 'P')
+    )
+    
     # Remove punctuation
     text = text.translate(str.maketrans('', '', string.punctuation))
     
-    # Remove extra whitespace
-    # Replace multiple spaces with single space
+    # Normalize whitespace again (removal of symbols may have created gaps)
     text = re.sub(r'\s+', ' ', text)
     
     # Strip leading/trailing whitespace

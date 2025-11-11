@@ -409,6 +409,219 @@ def test_current_job_tracking(worker, sample_tracks):
     worker.stop()
 
 
+def test_worker_processes_job(worker, sample_tracks):
+    """Test that worker processes a simple job successfully.
+    
+    Per test_spec.md requirement #2:
+    - Create worker
+    - Add simple job (mock migrator function)
+    - Start worker
+    - Wait for job completion
+    - Verify job status changed to 'completed'
+    """
+    # Create simple mock migrator
+    migrator_func = Mock(return_value={'matched_tracks': 2, 'total_tracks': 2})
+    
+    # Add job
+    job_id = worker.add_job(
+        playlist_name="Test Playlist",
+        playlist_id="sp_test_123",
+        tracks=sample_tracks,
+        migrator_func=migrator_func
+    )
+    
+    # Start worker
+    worker.start()
+    
+    # Wait for job to complete with timeout
+    max_wait = 5.0
+    start_time = time.time()
+    while time.time() - start_time < max_wait:
+        status = worker.get_job_status(job_id)
+        if status and status['status'] == 'completed':
+            break
+        time.sleep(0.1)
+    
+    # Verify job status changed to 'completed'
+    status = worker.get_job_status(job_id)
+    assert status is not None
+    assert status['status'] == 'completed'
+    assert status['playlist_name'] == "Test Playlist"
+    
+    # Verify migrator was called
+    migrator_func.assert_called_once()
+    
+    # Cleanup
+    worker.stop()
+
+
+def test_worker_handles_exception(worker, sample_tracks):
+    """Test that worker handles exceptions in jobs.
+    
+    Per test_spec.md requirement #3:
+    - Add job that raises exception
+    - Start worker
+    - Verify status changed to 'failed'
+    - Verify error logged
+    """
+    # Create migrator that raises exception
+    error_message = "Test migration error"
+    migrator_func = Mock(side_effect=Exception(error_message))
+    
+    # Add job
+    job_id = worker.add_job(
+        playlist_name="Failing Playlist",
+        playlist_id="sp_fail_123",
+        tracks=sample_tracks,
+        migrator_func=migrator_func
+    )
+    
+    # Start worker
+    worker.start()
+    
+    # Wait for job to fail with timeout
+    max_wait = 5.0
+    start_time = time.time()
+    while time.time() - start_time < max_wait:
+        status = worker.get_job_status(job_id)
+        if status and status['status'] == 'failed':
+            break
+        time.sleep(0.1)
+    
+    # Verify job status changed to 'failed'
+    status = worker.get_job_status(job_id)
+    assert status is not None
+    assert status['status'] == 'failed'
+    assert error_message in status['error_message']
+    
+    # Cleanup
+    worker.stop()
+
+
+def test_multiple_jobs_processed_in_order(worker, sample_tracks):
+    """Test that multiple jobs are processed in FIFO order.
+    
+    Per test_spec.md requirement #4:
+    - Add 3 jobs
+    - Verify processed in FIFO order
+    """
+    # Track job processing order
+    processing_order = []
+    
+    def create_migrator(job_number):
+        """Create a migrator that records its job number."""
+        def migrator(playlist_name, tracks, progress_callback):
+            processing_order.append(job_number)
+            time.sleep(0.1)  # Small delay to ensure sequential processing
+            return {'matched_tracks': len(tracks), 'total_tracks': len(tracks)}
+        return migrator
+    
+    # Add 3 jobs
+    job_ids = []
+    for i in range(1, 4):
+        job_id = worker.add_job(
+            playlist_name=f"Playlist {i}",
+            playlist_id=f"sp_job_{i}",
+            tracks=sample_tracks,
+            migrator_func=create_migrator(i)
+        )
+        job_ids.append(job_id)
+    
+    # Start worker
+    worker.start()
+    
+    # Wait for all jobs to complete with timeout
+    max_wait = 10.0
+    start_time = time.time()
+    while time.time() - start_time < max_wait:
+        all_completed = True
+        for job_id in job_ids:
+            status = worker.get_job_status(job_id)
+            if not status or status['status'] not in ['completed', 'failed']:
+                all_completed = False
+                break
+        if all_completed:
+            break
+        time.sleep(0.1)
+    
+    # Verify jobs were processed in FIFO order (1, 2, 3)
+    assert processing_order == [1, 2, 3], f"Expected [1, 2, 3], got {processing_order}"
+    
+    # Verify all jobs completed successfully
+    for i, job_id in enumerate(job_ids, 1):
+        status = worker.get_job_status(job_id)
+        assert status['status'] == 'completed', f"Job {i} did not complete successfully"
+    
+    # Cleanup
+    worker.stop()
+
+
+def test_progress_tracking(worker, sample_tracks):
+    """Test dedicated progress tracking with callbacks.
+    
+    Per test_spec.md requirement #7:
+    - Add job with progress callback
+    - Verify callback called with correct values
+    """
+    # Track progress callback invocations
+    progress_calls = []
+    
+    def progress_callback(current, total, track_name):
+        """Track all progress callback invocations."""
+        progress_calls.append({
+            'current': current,
+            'total': total,
+            'track_name': track_name
+        })
+    
+    def migrator_with_progress(playlist_name, tracks, callback):
+        """Migrator that reports progress for each track."""
+        for idx, track in enumerate(tracks, 1):
+            callback(idx, len(tracks), track.get('name', f'Track {idx}'))
+            time.sleep(0.05)  # Small delay between tracks
+        return {'matched_tracks': len(tracks), 'total_tracks': len(tracks)}
+    
+    # Add job with progress callback
+    job_id = worker.add_job(
+        playlist_name="Progress Test Playlist",
+        playlist_id="sp_progress_123",
+        tracks=sample_tracks,
+        migrator_func=migrator_with_progress,
+        progress_callback=progress_callback
+    )
+    
+    # Start worker
+    worker.start()
+    
+    # Wait for job to complete with timeout
+    max_wait = 5.0
+    start_time = time.time()
+    while time.time() - start_time < max_wait:
+        status = worker.get_job_status(job_id)
+        if status and status['status'] == 'completed':
+            break
+        time.sleep(0.1)
+    
+    # Verify job completed
+    status = worker.get_job_status(job_id)
+    assert status['status'] == 'completed'
+    
+    # Verify progress callbacks were called
+    assert len(progress_calls) == len(sample_tracks), \
+        f"Expected {len(sample_tracks)} progress calls, got {len(progress_calls)}"
+    
+    # Verify progress values
+    for idx, call in enumerate(progress_calls, 1):
+        assert call['current'] == idx, f"Call {idx}: expected current={idx}, got {call['current']}"
+        assert call['total'] == len(sample_tracks), \
+            f"Call {idx}: expected total={len(sample_tracks)}, got {call['total']}"
+        assert call['track_name'] == sample_tracks[idx-1].get('name', f'Track {idx}'), \
+            f"Call {idx}: track name mismatch"
+    
+    # Cleanup
+    worker.stop()
+
+
 # ============================================================================
 # Test: Get Job Status
 # ============================================================================

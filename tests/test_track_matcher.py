@@ -568,6 +568,92 @@ def test_match_track_threshold_boundary():
     assert score >= 80
 
 
+def test_no_match_below_threshold():
+    """Test that match_track returns None when score below threshold.
+    
+    Per test_spec.md requirement #6:
+    - matcher with threshold=75
+    - Best result has score=70
+    - Expected: match_track returns (None, 0)
+    """
+    matcher = TrackMatcher(threshold=75)
+    
+    spotify_track = {
+        'name': 'Some Song Title',
+        'artists': ['Artist Name'],
+        'album': 'Album Name',
+        'duration_ms': 200000
+    }
+    
+    # Create YouTube results that will score below 75
+    # Similar title but different artist = low score
+    youtube_results = [
+        {
+            'videoId': 'video_low_score',
+            'title': 'Similar Song Title',  # Slightly different
+            'artists': [{'name': 'Different Artist'}],  # Wrong artist
+            'album': {'name': 'Different Album'},
+            'duration_seconds': 220  # Off by 20 seconds
+        }
+    ]
+    
+    video_id, score = matcher.match_track(spotify_track, youtube_results)
+    
+    # Should return None and 0 since no match exceeds threshold
+    assert video_id is None
+    assert score == 0
+
+
+def test_multiple_results_picks_best():
+    """Test that match_track selects highest scoring result.
+    
+    Per test_spec.md requirement #7:
+    - YouTube results: [score 60, score 85, score 70]
+    - Expected: Returns result with score 85
+    """
+    matcher = TrackMatcher(threshold=60)
+    
+    spotify_track = {
+        'name': 'Blinding Lights',
+        'artists': ['The Weeknd'],
+        'album': 'After Hours',
+        'duration_ms': 200000
+    }
+    
+    youtube_results = [
+        # Result 1: Low score (different artist)
+        {
+            'videoId': 'low_score_60',
+            'title': 'Blinding Lights Cover',
+            'artists': [{'name': 'Cover Artist'}],
+            'album': {'name': 'Cover Album'},
+            'duration_seconds': 180
+        },
+        # Result 2: High score (best match)
+        {
+            'videoId': 'high_score_85',
+            'title': 'The Weeknd - Blinding Lights',
+            'artists': [{'name': 'The Weeknd'}],
+            'album': {'name': 'After Hours'},
+            'duration_seconds': 200  # Perfect duration match
+        },
+        # Result 3: Medium score (correct artist, wrong album)
+        {
+            'videoId': 'medium_score_70',
+            'title': 'Blinding Lights Live',
+            'artists': [{'name': 'The Weeknd'}],
+            'album': {'name': 'Live Album'},
+            'duration_seconds': 215
+        }
+    ]
+    
+    video_id, score = matcher.match_track(spotify_track, youtube_results)
+    
+    # Should return the best match (high_score_85)
+    assert video_id == 'high_score_85'
+    assert score >= 85
+
+
 # ============================================================================
 # Real-World Integration Tests
 # ============================================================================

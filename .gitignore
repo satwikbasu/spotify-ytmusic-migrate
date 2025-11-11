@@ -219,3 +219,5 @@ logs/
 
 # Project specification
 spec.md
+test_spec.md
+TEST_GAP_ANALYSIS.md

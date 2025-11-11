@@ -76,6 +76,26 @@ def test_normalize_string_edge_cases():
     assert normalize_string("a") == "a"
 
 
+def test_unicode_characters():
+    """Test that emojis and unicode characters are removed.
+    
+    Per test_spec.md requirement #9:
+    Input: "🎵 Song Name 🎵"
+    Expected: "song name" (emojis removed)
+    """
+    # Test emojis
+    assert normalize_string("🎵 Song Name 🎵") == "song name"
+    assert normalize_string("Artist 😊 Name") == "artist name"
+    assert normalize_string("💿 Album Title 🎧") == "album title"
+    
+    # Test other unicode symbols
+    assert normalize_string("Song ™ Name") == "song name"
+    assert normalize_string("© Copyright ®") == "copyright"
+    
+    # Test mixed content
+    assert normalize_string("🎵 Blinding Lights 💎 (Official)") == "blinding lights official"
+
+
 # ============================================================================
 # remove_noise_words() Tests
 # ============================================================================
