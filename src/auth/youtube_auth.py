@@ -1,366 +1,374 @@
-"""YouTube Music OAuth 2.0 Authentication Module.
+"""YouTube Music Authentication Module.
 
-This module provides authentication functionality for the YouTube Music API using
-Google's OAuth 2.0 flow with the ytmusicapi library.
+This module provides authentication functionality for YouTube Music API using
+ytmusicapi's browser-based authentication (recommended) or OAuth fallback.
+
+RECOMMENDED: Browser Authentication
+    - More reliable than OAuth
+    - Uses your actual browser session cookies
+    - See BROWSER_AUTH_INSTRUCTIONS.md for setup
+
+OAuth Authentication (Fallback)
+    - May not work due to YouTube Music's internal API
+    - Requires OAuth Client ID type "TVs and Limited Input devices"
+    - See BROWSER_AUTH_INSTRUCTIONS.md for why browser auth is better
+
+Authentication Flow:
+    1. Check for browser headers file (headers.json or browser.json)
+    2. If exists, use browser authentication
+    3. Otherwise, fall back to OAuth:
+       a. Check for existing token file (~/youtube_oauth.json)
+       b. If exists and valid, load cached token
+       c. If not, start device code flow
+    4. Create YTMusic client with authenticated credentials
+
+Example:
+    >>> auth = YouTubeAuthenticator()
+    >>> yt = auth.authenticate()
+    >>> playlists = yt.get_library_playlists()
 """
 
-import os
-import json
-from typing import Optional, Dict, Any
-from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Optional
+import logging
 
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
 from ytmusicapi import YTMusic
-import requests.exceptions
+from ytmusicapi.auth.oauth import OAuthCredentials, RefreshingToken
+
+
+logger = logging.getLogger(__name__)
 
 
 class YouTubeAuthenticator:
-    """Handles YouTube Music OAuth 2.0 authentication and token management.
-    
-    This class manages the OAuth 2.0 flow for YouTube Music API authentication,
-    including token storage, validation, and automatic refresh.
-    
-    The authentication process:
-    1. Creates OAuth 2.0 flow with client credentials
-    2. Launches local server to handle OAuth callback
-    3. User authorizes in browser
-    4. Receives authorization code and exchanges for tokens
-    5. Stores tokens in JSON file for future use
-    
+    """Handles YouTube Music OAuth 2.0 authentication with device code flow.
+
+    Uses ytmusicapi's native OAuth implementation for TV/Limited Input devices.
+    This flow displays a URL and code for the user to enter in their browser.
+
     Attributes:
-        client_id (str): Google OAuth client ID.
-        client_secret (str): Google OAuth client secret.
-        scope (str): YouTube API scope for full access.
-        credentials_path (str): Path to the token cache file.
-        oauth_port (int): Port for local OAuth callback server.
+        client_id: OAuth 2.0 client ID from Google Cloud Console
+        client_secret: OAuth 2.0 client secret from Google Cloud Console
+        credentials_path: Path to store OAuth token (default: ~/youtube_oauth.json)
+
+    Raises:
+        ValueError: If client_id or client_secret is empty
+        RuntimeError: If authentication fails or API test fails
     """
-    
-    REQUIRED_SCOPE = "https://www.googleapis.com/auth/youtube.force-ssl"
-    OAUTH_PORT = 8080
-    CREDENTIALS_FILENAME = "youtube_oauth.json"
-    
-    def __init__(self, client_id: str, client_secret: str):
-        """Initialize the YouTube Music authenticator.
-        
+
+    def __init__(self, client_id: Optional[str] = None, client_secret: Optional[str] = None):
+        """Initialize the YouTubeAuthenticator.
+
         Args:
-            client_id (str): Google OAuth client ID from Google Cloud Console.
-            client_secret (str): Google OAuth client secret from Google Cloud Console.
-            
-        Raises:
-            ValueError: If client_id or client_secret is empty or None.
+            client_id: OAuth 2.0 client ID from Google Cloud Console (optional if using browser auth)
+            client_secret: OAuth 2.0 client secret from Google Cloud Console (optional if using browser auth)
+
+        Note:
+            If both client_id and client_secret are None, only browser authentication will be available.
         """
-        if not client_id or not client_secret:
-            raise ValueError("Client ID and Client Secret are required")
-        
         self.client_id = client_id
         self.client_secret = client_secret
-        self.scope = self.REQUIRED_SCOPE
-        self.credentials_path = os.path.expanduser(f"~/{self.CREDENTIALS_FILENAME}")
-        self.oauth_port = self.OAUTH_PORT
-    
-    def _create_client_config(self) -> Dict[str, Any]:
-        """Create the OAuth client configuration dictionary.
         
-        Returns:
-            Dict[str, Any]: Client configuration in the format required by InstalledAppFlow.
-        """
-        return {
-            "installed": {
-                "client_id": self.client_id,
-                "client_secret": self.client_secret,
-                "redirect_uris": [
-                    f"http://localhost:{self.oauth_port}/",
-                    "urn:ietf:wg:oauth:2.0:oob"
-                ],
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-                "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs"
-            }
-        }
-    
-    def _credentials_to_dict(self, credentials: Credentials) -> Dict[str, Any]:
-        """Convert Google OAuth credentials to ytmusicapi format.
+        # Use pathlib for cross-platform path handling
+        self.credentials_path = Path.home() / "youtube_oauth.json"
+        self.browser_headers_path = Path("headers.json")
+        self.browser_alt_path = Path("browser.json")
         
-        Args:
-            credentials (Credentials): Google OAuth2 credentials object.
-            
-        Returns:
-            Dict[str, Any]: Credentials dictionary in ytmusicapi format.
-        """
-        creds_dict = {
-            "access_token": credentials.token,
-            "refresh_token": credentials.refresh_token,
-            "token_uri": credentials.token_uri,
-            "client_id": credentials.client_id,
-            "client_secret": credentials.client_secret,
-            "scopes": credentials.scopes,
-        }
-        
-        # Add expiry timestamp if available
-        if credentials.expiry:
-            creds_dict["expiry"] = credentials.expiry.isoformat()
-        
-        return creds_dict
-    
-    def _load_credentials(self) -> Optional[Dict[str, Any]]:
-        """Load credentials from the cache file.
-        
-        Returns:
-            Optional[Dict[str, Any]]: Credentials dictionary if file exists and is valid,
-                None otherwise.
-        """
-        try:
-            if not os.path.exists(self.credentials_path):
-                return None
-            
-            with open(self.credentials_path, 'r') as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError) as e:
-            print(f"Warning: Failed to load credentials: {str(e)}")
-            return None
-    
-    def _save_credentials(self, creds_dict: Dict[str, Any]) -> None:
-        """Save credentials to the cache file.
-        
-        Args:
-            creds_dict (Dict[str, Any]): Credentials dictionary to save.
-            
-        Raises:
-            IOError: If unable to write to the credentials file.
-        """
-        try:
-            with open(self.credentials_path, 'w') as f:
-                json.dump(creds_dict, f, indent=2)
-            print(f"Credentials saved to: {self.credentials_path}")
-        except IOError as e:
-            raise IOError(f"Failed to save credentials: {str(e)}") from e
-    
-    def _refresh_token_if_needed(self, creds_dict: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Refresh the access token if it's expired or about to expire.
-        
-        Args:
-            creds_dict (Dict[str, Any]): Current credentials dictionary.
-            
-        Returns:
-            Optional[Dict[str, Any]]: Updated credentials dictionary if refresh was successful,
-                None if refresh failed or wasn't needed.
-        """
-        try:
-            # Check if token has expiry information
-            if "expiry" not in creds_dict:
-                return None
-            
-            # Parse expiry timestamp
-            expiry = datetime.fromisoformat(creds_dict["expiry"])
-            
-            # Refresh if token expires within 5 minutes
-            if expiry > datetime.now(timezone.utc) + timedelta(minutes=5):
-                return None  # Token is still valid
-            
-            print("Access token expired or expiring soon. Refreshing...")
-            
-            # Create credentials object from dict
-            credentials = Credentials(
-                token=creds_dict.get("access_token"),
-                refresh_token=creds_dict.get("refresh_token"),
-                token_uri=creds_dict.get("token_uri"),
-                client_id=creds_dict.get("client_id"),
-                client_secret=creds_dict.get("client_secret"),
-                scopes=creds_dict.get("scopes")
-            )
-            
-            # Refresh the token
-            credentials.refresh(Request())
-            
-            # Convert back to dictionary and save
-            updated_creds = self._credentials_to_dict(credentials)
-            self._save_credentials(updated_creds)
-            
-            print("Access token refreshed successfully")
-            return updated_creds
-            
-        except Exception as e:
-            print(f"Warning: Failed to refresh token: {str(e)}")
-            return None
-    
+        logger.info(f"YouTubeAuthenticator initialized")
+        logger.info(f"OAuth credentials path: {self.credentials_path}")
+        logger.info(f"Browser headers path: {self.browser_headers_path}")
+
     def authenticate(self) -> YTMusic:
-        """Authenticate with YouTube Music and return an authenticated client.
-        
-        This method implements the full OAuth 2.0 flow:
-        
-        1. Check for cached credentials and refresh if needed
-        2. If no valid credentials, initiate OAuth flow:
-           a. Create OAuth client configuration
-           b. Initialize InstalledAppFlow with client config and scopes
-           c. Launch local web server on port 8080
-           d. Open browser for user authorization
-           e. Receive authorization code via callback
-           f. Exchange code for access and refresh tokens
-        3. Convert credentials to ytmusicapi format
-        4. Save credentials to JSON file for future use
-        5. Create and return authenticated YTMusic client
-        
+        """Authenticate with YouTube Music using browser headers or OAuth.
+
+        Authentication priority:
+        1. Browser authentication (headers.json or browser.json) - RECOMMENDED
+        2. OAuth authentication (cached token or device code flow) - FALLBACK
+
+        Browser Authentication:
+            - Most reliable method
+            - Uses actual browser session cookies
+            - See BROWSER_AUTH_INSTRUCTIONS.md for setup
+
+        OAuth Authentication:
+            - May not work due to YouTube Music's internal API
+            - Falls back to device code flow if no cached token
+
         Returns:
-            YTMusic: An authenticated YouTube Music API client instance.
-            
+            YTMusic: Authenticated YouTube Music API client
+
         Raises:
-            RuntimeError: If user denies authorization or OAuth flow fails.
-            requests.exceptions.RequestException: If network errors occur.
-            ValueError: If credentials are invalid or malformed.
+            RuntimeError: If authentication fails or API test fails
+        """
+        # Try browser authentication first (recommended)
+        if self.browser_headers_path.exists():
+            logger.info(f"Found browser headers file: {self.browser_headers_path}")
+            return self._authenticate_browser(self.browser_headers_path)
+        elif self.browser_alt_path.exists():
+            logger.info(f"Found browser headers file: {self.browser_alt_path}")
+            return self._authenticate_browser(self.browser_alt_path)
+        
+        # Fall back to OAuth
+        logger.info("No browser headers found, trying OAuth authentication")
+        if not self.client_id or not self.client_secret:
+            raise RuntimeError(
+                "No browser authentication file found and OAuth credentials not provided.\n"
+                "Please run 'ytmusicapi browser' to set up browser authentication.\n"
+                "See BROWSER_AUTH_INSTRUCTIONS.md for details."
+            )
+        
+        return self._authenticate_oauth()
+
+    def _authenticate_browser(self, headers_path: Path) -> YTMusic:
+        """Authenticate using browser headers.
+
+        Args:
+            headers_path: Path to browser headers JSON file
+
+        Returns:
+            YTMusic: Authenticated YouTube Music API client
+
+        Raises:
+            RuntimeError: If authentication fails
         """
         try:
-            # Step 1: Check for existing credentials
-            creds_dict = self._load_credentials()
+            print(f"Loading YouTube Music credentials from {headers_path}")
+            print("Using browser authentication (recommended method)")
             
-            if creds_dict:
-                # Try to refresh token if needed
-                refreshed_creds = self._refresh_token_if_needed(creds_dict)
-                if refreshed_creds:
-                    creds_dict = refreshed_creds
-                
-                # Attempt to create YTMusic client with cached credentials
-                try:
-                    yt = YTMusic(auth=self.credentials_path)
-                    # Test the connection with a simple API call
-                    yt.get_account_info()
-                    print("Using cached YouTube Music credentials")
-                    return yt
-                except Exception as e:
-                    print(f"Cached credentials invalid: {str(e)}. Re-authenticating...")
-                    # Fall through to new OAuth flow
+            # Create YTMusic client with browser headers
+            yt = YTMusic(str(headers_path))
+            logger.info("YTMusic client created with browser authentication")
             
-            # Step 2: No valid cached credentials - initiate OAuth flow
-            print("Starting YouTube Music OAuth flow...")
-            print(f"A browser window will open for authorization.")
-            
-            # Create client configuration
-            client_config = self._create_client_config()
-            
-            # Step 3: Initialize OAuth flow
-            flow = InstalledAppFlow.from_client_config(
-                client_config=client_config,
-                scopes=[self.scope]
-            )
-            
-            # Step 4: Run local server to handle OAuth callback
-            # This will:
-            # - Start a local web server on localhost:8080
-            # - Open the user's browser to Google's authorization page
-            # - Wait for the user to authorize the application
-            # - Receive the authorization code via HTTP callback
-            # - Exchange the code for access and refresh tokens
+            # Verify the session is genuinely signed in.
+            #
+            # get_library_playlists() is not a usable check: a signed-out session
+            # returns an empty list rather than raising, so an expired cookie was
+            # indistinguishable from an account with no playlists. get_account_info()
+            # needs a real identity and fails without one.
+            print("Testing YouTube Music API connection...")
             try:
-                credentials = flow.run_local_server(
-                    port=self.oauth_port,
-                    success_message="Authentication successful! You can close this window.",
-                    open_browser=True
+                account = yt.get_account_info()
+            except Exception as e:
+                logger.warning(f"Account check failed: {e}")
+                raise RuntimeError(
+                    "YouTube Music rejected these credentials - the session is not "
+                    "signed in.\n"
+                    "Your cookies have most likely expired. Run 'ytmusicapi browser' "
+                    "to capture a fresh headers.json while logged in to "
+                    "music.youtube.com.\n"
+                    "See BROWSER_AUTH_INSTRUCTIONS.md for details."
+                ) from e
+
+            if not account:
+                raise RuntimeError(
+                    "YouTube Music returned no account for these credentials - the "
+                    "session is not signed in. Run 'ytmusicapi browser' to refresh."
                 )
-            except Exception as e:
-                if "access_denied" in str(e).lower():
-                    raise RuntimeError(
-                        "User denied authorization. Please grant access to continue."
-                    ) from e
-                raise RuntimeError(
-                    f"OAuth flow failed: {str(e)}. Please check your network connection "
-                    f"and ensure port {self.oauth_port} is available."
-                ) from e
-            
-            if not credentials:
-                raise RuntimeError("Failed to obtain credentials from OAuth flow")
-            
-            # Step 5: Convert credentials to ytmusicapi format
-            creds_dict = self._credentials_to_dict(credentials)
-            
-            # Step 6: Save credentials to file
-            self._save_credentials(creds_dict)
-            
-            # Step 7: Create and return authenticated YTMusic client
-            yt = YTMusic(auth=self.credentials_path)
-            
-            # Verify authentication with a test API call
-            try:
-                yt.get_account_info()
-                print("YouTube Music authentication successful!")
-            except Exception as e:
-                raise RuntimeError(
-                    f"Authentication succeeded but API test failed: {str(e)}"
-                ) from e
+
+            account_name = account.get("accountName") if isinstance(account, dict) else None
+            print(f"✅ Signed in to YouTube Music as {account_name or 'your account'}")
+            logger.info("Account check successful")
             
             return yt
             
-        except requests.exceptions.RequestException as e:
-            raise requests.exceptions.RequestException(
-                f"Network error during YouTube Music authentication: {str(e)}"
-            ) from e
-        except ValueError as e:
-            raise ValueError(
-                f"Invalid credentials or configuration: {str(e)}"
-            ) from e
-        except RuntimeError:
-            # Re-raise RuntimeError as-is
-            raise
         except Exception as e:
+            logger.error(f"Browser authentication failed: {e}")
             raise RuntimeError(
-                f"Unexpected error during YouTube Music authentication: {str(e)}"
+                f"Failed to authenticate with browser headers from {headers_path}\n"
+                f"Error: {e}\n"
+                "Your session may have expired. Run 'ytmusicapi browser' to refresh.\n"
+                "See BROWSER_AUTH_INSTRUCTIONS.md for details."
             ) from e
+
+    def _authenticate_oauth(self) -> YTMusic:
+        """Refuse the OAuth path, which cannot work against YouTube Music.
+
+        The device-code flow itself succeeds and returns a valid token with a
+        refresh token, and ytmusicapi applies it correctly. Every authenticated
+        call then returns HTTP 400 "Request contains an invalid argument",
+        because YouTube Music's internal API does not accept tokens issued to
+        custom Google Cloud clients - regardless of the client type. Browser
+        cookies are the only authentication it honours.
+
+        Raises:
+            RuntimeError: Always, explaining how to authenticate instead.
+        """
+        raise RuntimeError(
+            "OAuth cannot authenticate against YouTube Music.\n"
+            "The token is issued correctly, but every API call is rejected with "
+            "HTTP 400 because YouTube Music's internal API ignores tokens from "
+            "custom Google Cloud clients.\n"
+            "Use browser authentication instead: run 'ytmusicapi browser' while "
+            "signed in to music.youtube.com to create headers.json.\n"
+            "See BROWSER_AUTH_INSTRUCTIONS.md for details."
+        )
+
+    def _authenticate_oauth_unused(self) -> YTMusic:
+        """Retained for reference only; see _authenticate_oauth above."""
+        try:
+            # Create OAuth credentials object
+            credentials = OAuthCredentials(
+                client_id=self.client_id,
+                client_secret=self.client_secret
+            )
+            logger.info("Created OAuthCredentials object")
+
+            # Check for existing token file
+            if self.credentials_path.exists():
+                logger.info(f"Found existing token file: {self.credentials_path}")
+                print(f"Loading cached YouTube Music credentials from {self.credentials_path}")
+                
+                try:
+                    # Load and refresh existing token
+                    # Note: parameter is file_path not filepath
+                    token = RefreshingToken.from_json(
+                        file_path=str(self.credentials_path),
+                        client_id=self.client_id,
+                        client_secret=self.client_secret
+                    )
+                    logger.info("Successfully loaded existing token")
+                    
+                    # Create YTMusic client with cached token
+                    # IMPORTANT: Must pass BOTH auth (file path) AND oauth_credentials (object)
+                    yt = YTMusic(auth=str(self.credentials_path), oauth_credentials=credentials)
+                    
+                    # Test the connection
+                    yt.get_library_playlists(limit=1)
+                    print("YouTube Music authentication successful (using cached credentials)")
+                    logger.info("Authentication successful with cached credentials")
+                    return yt
+                    
+                except Exception as e:
+                    logger.warning(f"Cached credentials invalid: {e}")
+                    print(f"Cached credentials invalid: {e}")
+                    print("Starting new authentication flow...")
+                    # Fall through to new authentication
+
+            # No valid cached token - start device code flow
+            print("\n" + "="*70)
+            print("YouTube Music Authentication - Device Code Flow")
+            print("="*70)
+            print("\nIMPORTANT: This requires OAuth Client ID type 'TVs and Limited Input devices'")
+            print("If you see errors, verify your OAuth client type in Google Cloud Console.\n")
+            logger.info("Starting device code flow authentication")
+
+            # Prompt for token with device code flow
+            # This will:
+            # 1. Display a URL and code
+            # 2. Open browser automatically (if possible)
+            # 3. Wait for user to authorize
+            # 4. Save token to file automatically
+            try:
+                token = RefreshingToken.prompt_for_token(
+                    credentials=credentials,
+                    open_browser=True,
+                    to_file=str(self.credentials_path)
+                )
+                logger.info(f"Device code flow completed, token saved to {self.credentials_path}")
+                print(f"\nCredentials saved to: {self.credentials_path}")
+            except TypeError as e:
+                error_msg = str(e)
+                if "unexpected keyword argument 'error'" in error_msg:
+                    logger.error(f"OAuth server returned an error: {e}")
+                    raise RuntimeError(
+                        "YouTube OAuth configuration error.\n\n"
+                        "This usually means your OAuth Client ID type is incorrect.\n\n"
+                        "Required: 'TVs and Limited Input devices'\n"
+                        "NOT: 'Desktop app' or 'Web application'\n\n"
+                        "Steps to fix:\n"
+                        "1. Go to: https://console.cloud.google.com/apis/credentials\n"
+                        "2. Delete your current OAuth Client ID\n"
+                        "3. Create NEW OAuth Client ID\n"
+                        "4. Select type: 'TVs and Limited Input devices'\n"
+                        "5. Update your .env file with the new credentials\n"
+                        "6. Run the app again"
+                    ) from e
+                raise
+
+            # Create YTMusic client with new token
+            # IMPORTANT: Must pass BOTH auth (file path) AND oauth_credentials (object)
+            yt = YTMusic(auth=str(self.credentials_path), oauth_credentials=credentials)
+            
+            # Test the connection
+            print("\nTesting YouTube Music API connection...")
+            yt.get_library_playlists(limit=1)
+            
+            print("\n" + "="*70)
+            print("YouTube Music authentication successful!")
+            print("="*70 + "\n")
+            logger.info("Authentication successful with new credentials")
+            
+            return yt
+            
+        except ValueError as e:
+            logger.error(f"Invalid credentials: {e}")
+            raise ValueError(
+                f"Invalid client credentials: {e}\n"
+                "Please verify YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET in .env file.\n"
+                "Ensure you're using OAuth Client ID type 'TVs and Limited Input devices'."
+            ) from e
+        except RuntimeError as e:
+            logger.error(f"Authentication runtime error: {e}", exc_info=True)
+            raise RuntimeError(f"YouTube Music authentication failed: {e}") from e
+        except Exception as e:
+            logger.error(f"Unexpected authentication error: {e}", exc_info=True)
+            # Get more specific error message
+            error_str = str(e).lower()
+            if "quota" in error_str or "rate" in error_str:
+                raise RuntimeError(
+                    f"YouTube API quota exceeded or rate limit reached: {e}\n"
+                    "Please wait a few minutes and try again."
+                ) from e
+            elif "permission" in error_str or "access" in error_str:
+                raise RuntimeError(
+                    f"Permission denied: {e}\n"
+                    "Please ensure your Google account is added as a test user in OAuth consent screen."
+                ) from e
+            else:
+                raise RuntimeError(
+                    f"Unexpected error during YouTube Music authentication: {e}\n"
+                    "Please ensure:\n"
+                    "1. OAuth Client ID type is 'TVs and Limited Input devices'\n"
+                    "2. YouTube Data API v3 is enabled in Google Cloud Console\n"
+                    "3. Your Google account is added as a test user in OAuth consent screen"
+                ) from e
     
     def is_authenticated(self) -> bool:
         """Check if valid YouTube Music credentials exist.
-        
-        This method verifies:
-        1. Credentials file exists
-        2. File contains valid JSON
-        3. Required fields are present
-        4. Token is not expired (if expiry field exists)
-        
+
         Returns:
-            bool: True if valid credentials exist, False otherwise.
+            bool: True if token file exists and is valid, False otherwise
         """
+        if not self.credentials_path.exists():
+            return False
+            
         try:
-            creds_dict = self._load_credentials()
-            
-            if not creds_dict:
-                return False
-            
-            # Check for required fields
-            required_fields = ["access_token", "refresh_token", "token_uri", 
-                             "client_id", "client_secret"]
-            if not all(field in creds_dict for field in required_fields):
-                return False
-            
-            # Check token expiry if available
-            if "expiry" in creds_dict:
-                try:
-                    expiry = datetime.fromisoformat(creds_dict["expiry"])
-                    # Consider expired if less than 1 minute remaining
-                    if expiry <= datetime.now(timezone.utc) + timedelta(minutes=1):
-                        # Token expired, but we have refresh token
-                        # Authentication method will handle refresh
-                        return True  # Refresh token allows re-authentication
-                except (ValueError, TypeError):
-                    pass  # Invalid expiry format, but other fields may be valid
-            
+            # Try to load token - if this succeeds, credentials are valid
+            # Note: parameter is file_path not filepath
+            credentials = OAuthCredentials(
+                client_id=self.client_id,
+                client_secret=self.client_secret
+            )
+            RefreshingToken.from_json(
+                file_path=str(self.credentials_path),
+                client_id=self.client_id,
+                client_secret=self.client_secret
+            )
             return True
-            
         except Exception:
             return False
-    
+
     def clear_cache(self) -> None:
         """Remove cached YouTube Music credentials from disk.
-        
-        This method deletes the credentials file, requiring the user to
-        re-authenticate on the next authentication attempt.
-        
-        Note:
-            This method does not raise an error if the credentials file doesn't exist.
+
+        Deletes the token file, requiring re-authentication on next use.
         """
         try:
-            if os.path.exists(self.credentials_path):
-                os.remove(self.credentials_path)
+            if self.credentials_path.exists():
+                self.credentials_path.unlink()
                 print(f"YouTube Music cache cleared: {self.credentials_path}")
+                logger.info(f"Cleared credentials cache: {self.credentials_path}")
             else:
                 print("No YouTube Music cache found to clear")
         except OSError as e:
-            print(f"Warning: Failed to clear YouTube Music cache: {str(e)}")
+            logger.warning(f"Failed to clear cache: {e}")
+            print(f"Warning: Failed to clear YouTube Music cache: {e}")

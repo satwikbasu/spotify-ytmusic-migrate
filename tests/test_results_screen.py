@@ -55,13 +55,13 @@ def app_state_detailed():
                     {
                         'name': 'Unknown Track',
                         'artist': 'Unknown Artist',
-                        'spotify_id': 'abc123',
+                        'id': 'abc123',
                         'failure_reason': 'No match found'
                     },
                     {
                         'name': 'Rare Song',
                         'artist': 'Indie Band',
-                        'spotify_id': 'def456',
+                        'id': 'def456',
                         'failure_reason': 'Low confidence'
                     }
                 ],
@@ -75,7 +75,7 @@ def app_state_detailed():
                     {
                         'name': 'Foreign Song',
                         'artist': 'Foreign Artist',
-                        'spotify_id': 'ghi789',
+                        'id': 'ghi789',
                         'failure_reason': 'Region restricted'
                     }
                 ],
@@ -372,7 +372,7 @@ class TestResultsScreenExport:
                 {
                     'name': 'Track 1',
                     'artist': 'Artist 1',
-                    'spotify_id': 'sp1',
+                    'id': 'sp1',
                     'youtube_video_id': 'yt1',
                     'confidence': 95.5
                 }

@@ -170,13 +170,13 @@ class ResultsScreen(BaseScreen):
                 controls=[
                     ft.Icon(
                         name=ft.Icons.PLAYLIST_PLAY,
-                        color=app_config.TEXT_COLOR_DARK,
+                        color=app_config.TEXT_COLOR_LIGHT,
                         size=20
                     ),
                     ft.Text(
                         value=f"{self.total_playlists} playlist{'s' if self.total_playlists != 1 else ''} migrated",
                         size=app_config.BODY_SIZE,
-                        color=app_config.TEXT_COLOR_DARK
+                        color=app_config.TEXT_COLOR_LIGHT
                     )
                 ],
                 spacing=10
@@ -185,13 +185,13 @@ class ResultsScreen(BaseScreen):
                 controls=[
                     ft.Icon(
                         name=ft.Icons.MUSIC_NOTE,
-                        color=app_config.TEXT_COLOR_DARK,
+                        color=app_config.TEXT_COLOR_LIGHT,
                         size=20
                     ),
                     ft.Text(
                         value=f"{self.matched_count} / {self.total_tracks} songs ({self.success_rate * 100:.1f}%)",
                         size=app_config.BODY_SIZE,
-                        color=app_config.TEXT_COLOR_DARK
+                        color=app_config.TEXT_COLOR_LIGHT
                     )
                 ],
                 spacing=10
@@ -200,13 +200,13 @@ class ResultsScreen(BaseScreen):
                 controls=[
                     ft.Icon(
                         name=ft.Icons.TIMER,
-                        color=app_config.TEXT_COLOR_DARK,
+                        color=app_config.TEXT_COLOR_LIGHT,
                         size=20
                     ),
                     ft.Text(
                         value=f"Total time: {duration_str}",
                         size=app_config.BODY_SIZE,
-                        color=app_config.TEXT_COLOR_DARK
+                        color=app_config.TEXT_COLOR_LIGHT
                     )
                 ],
                 spacing=10
@@ -222,7 +222,7 @@ class ResultsScreen(BaseScreen):
                             value="Summary",
                             size=app_config.HEADING_SIZE_SMALL,
                             weight=ft.FontWeight.BOLD,
-                            color=app_config.TEXT_COLOR_DARK
+                            color=app_config.TEXT_COLOR_LIGHT
                         ),
                         ft.Divider(),
                         *summary_items
@@ -248,7 +248,7 @@ class ResultsScreen(BaseScreen):
                 content=ft.Text(
                     value="Detailed results not available",
                     size=app_config.CAPTION_SIZE,
-                    color=app_config.TEXT_COLOR_DARK,
+                    color=app_config.TEXT_COLOR_LIGHT,
                     italic=True
                 ),
                 padding=20
@@ -320,12 +320,12 @@ class ResultsScreen(BaseScreen):
                             value=name,
                             size=app_config.BODY_SIZE,
                             weight=ft.FontWeight.BOLD,
-                            color=app_config.TEXT_COLOR_DARK
+                            color=app_config.TEXT_COLOR_LIGHT
                         ),
                         ft.Text(
                             value=f"{matched}/{total} songs ({success_rate:.1f}%)",
                             size=app_config.CAPTION_SIZE,
-                            color=app_config.TEXT_COLOR_DARK
+                            color=app_config.TEXT_COLOR_LIGHT
                         )
                     ],
                     spacing=5

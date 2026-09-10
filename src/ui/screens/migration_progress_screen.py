@@ -131,7 +131,7 @@ class MigrationProgressScreen(BaseScreen):
             value="Migration in Progress",
             size=app_config.HEADING_SIZE_LARGE,
             weight=ft.FontWeight.BOLD,
-            color=app_config.TEXT_COLOR_DARK
+            color=app_config.TEXT_COLOR_LIGHT
         )
         
         # Animated sync icon (rotates continuously)
@@ -151,21 +151,21 @@ class MigrationProgressScreen(BaseScreen):
             value="Preparing migration...",
             size=app_config.HEADING_SIZE_SMALL,
             weight=ft.FontWeight.BOLD,
-            color=app_config.TEXT_COLOR_DARK
+            color=app_config.TEXT_COLOR_LIGHT
         )
         
         # Current track info
         self.track_text = ft.Text(
             value="Track 0 of 0",
             size=app_config.BODY_SIZE,
-            color=app_config.TEXT_COLOR_DARK
+            color=app_config.TEXT_COLOR_LIGHT
         )
         
         # Current track name
         self.track_name_text = ft.Text(
             value="",
             size=app_config.BODY_SIZE,
-            color=app_config.TEXT_COLOR_DARK,
+            color=app_config.TEXT_COLOR_LIGHT,
             italic=True
         )
         
@@ -191,13 +191,16 @@ class MigrationProgressScreen(BaseScreen):
         self.time_text = ft.Text(
             value="Estimated time: Calculating...",
             size=app_config.BODY_SIZE,
-            color=app_config.TEXT_COLOR_DARK
+            color=app_config.TEXT_COLOR_LIGHT
         )
         
-        # Tip banner
-        tip_banner = StatusBanner(
-            message="💡 Tip: You can minimize this window. We'll notify you when done!",
-            banner_type="info"
+        # Tip banner (with width constraint)
+        tip_banner = ft.Container(
+            content=StatusBanner(
+                message="💡 Tip: You can minimize this window. We'll notify you when done!",
+                banner_type="info"
+            ),
+            width=600  # 50% less than typical full width
         )
         
         # Action buttons
@@ -300,7 +303,7 @@ class MigrationProgressScreen(BaseScreen):
             
             # Initialize counts
             self.total_playlists = len(selected_playlists)
-            self.total_tracks = sum(p.get('track_count', 0) for p in selected_playlists)
+            self.total_tracks = sum(p.get('tracks_count', 0) for p in selected_playlists)
             self.start_time = time.time()
             
             # Show loading
@@ -337,7 +340,9 @@ class MigrationProgressScreen(BaseScreen):
         playlist_name: str,
         current: int,
         total: int,
-        track_name: str
+        track_name: str,
+        matched: int = 0,
+        failed: int = 0
     ) -> None:
         """Handle progress updates from background migration worker.
         
@@ -349,31 +354,39 @@ class MigrationProgressScreen(BaseScreen):
             current (int): Current track index (1-based).
             total (int): Total tracks in current playlist.
             track_name (str): Name of current track being processed.
+            matched (int): Number of successfully matched tracks so far.
+            failed (int): Number of failed tracks so far.
         """
-        # Throttle updates to max 1 per second
-        current_time = time.time()
-        if current_time - self.last_update_time < 1.0:
-            return
-        
         with self.update_lock:
-            self.last_update_time = current_time
+            # Debug logging
             
-            # Update state
+            # Always update state (don't throttle state updates, only UI)
             self.current_playlist_name = playlist_name
             self.current_track_index = current
             self.current_track_name = track_name
+            self.matched_count = matched
+            self.failed_count = failed
             
-            # Calculate overall progress
-            # Note: This is simplified - ideally track across all playlists
-            completed_tracks = current - 1  # Subtract current track
-            if completed_tracks > 0:
-                # Estimate success rate (this would come from actual results)
-                # For now, assume 95% success rate as placeholder
-                self.matched_count = int(completed_tracks * 0.95)
-                self.failed_count = completed_tracks - self.matched_count
+            # Check if migration is complete
+            # total_tracks is 0 until the migration reports its size; without
+            # this guard every early callback looks complete and bypasses throttling
+            is_complete = self.total_tracks > 0 and current >= self.total_tracks
             
-            # Update UI (thread-safe)
-            self._update_ui()
+            # Throttle UI updates to max 1 per second (but always update on completion)
+            current_time = time.time()
+            should_update_ui = (current_time - self.last_update_time >= 1.0) or is_complete
+            
+            if should_update_ui:
+                self.last_update_time = current_time
+                self._update_ui()
+            
+            # Trigger completion after final UI update
+            if is_complete and not self.is_cancelled:
+                # Schedule completion (use threading Timer since no event loop in this thread)
+                import threading
+                timer = threading.Timer(2.0, self.on_migration_complete)
+                timer.daemon = True
+                timer.start()
     
     def _update_ui(self) -> None:
         """Update all UI elements with current migration state.
@@ -582,9 +595,6 @@ class MigrationProgressScreen(BaseScreen):
         
         Called when all migrations finish. Stores results in app_state
         and navigates to results screen.
-        
-        Note: This would be called by monitoring migration_manager status,
-        but that implementation is left for future integration.
         """
         # Store results in app_state
         self.app_state['migration_results'] = {
@@ -595,15 +605,9 @@ class MigrationProgressScreen(BaseScreen):
             'duration': time.time() - self.start_time if self.start_time else 0
         }
         
-        # Navigate to results screen (not yet implemented)
-        # from src.ui.screens.results_screen import ResultsScreen
-        # self.navigate_to(ResultsScreen, progress_text="Step 5 of 5")
-        
-        # For now, show success message
-        self.show_success(
-            f"Migration complete! Matched {self.matched_count} of "
-            f"{self.total_tracks} tracks ({self.failed_count} failed)."
-        )
+        # Navigate to results screen
+        from src.ui.screens.results_screen import ResultsScreen
+        self.navigate_to(ResultsScreen, progress_text="Step 5 of 5")
     
     def _handle_back(self, e):
         """Handle back button click.

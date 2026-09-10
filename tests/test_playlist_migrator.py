@@ -75,14 +75,16 @@ def sample_tracks():
             'artists': ['The Weeknd'],
             'album': 'After Hours',
             'duration_ms': 200040,
-            'spotify_id': 'track1'
+            'id': 'track1',
+            'isrc': 'USUG11904206'
         },
         {
             'name': 'Shape of You',
             'artists': ['Ed Sheeran'],
             'album': '÷',
             'duration_ms': 233713,
-            'spotify_id': 'track2'
+            'id': 'track2',
+            'isrc': 'GBAHS1700024'
         }
     ]
 
@@ -216,9 +218,10 @@ def test_migrate_playlist_empty_tracks(migrator):
 def test_migrate_playlist_cache_hit(mock_sleep, migrator, mock_ytmusic, mock_searcher, mock_cache, sample_tracks):
     """Test migration uses cached matches."""
     # Setup cache to return matches
+    # CacheManager stores confidence as a 0.0-1.0 decimal, not a percentage
     mock_cache.get_cached_match.return_value = {
         'youtube_video_id': 'cached_video',
-        'confidence': 98.0
+        'confidence': 0.98
     }
     
     report = migrator.migrate_playlist("Test", sample_tracks)
@@ -258,13 +261,17 @@ def test_migrate_playlist_cache_miss_then_cache(mock_sleep, migrator, mock_cache
 
 @patch('src.migrators.playlist_migrator.time.sleep')
 def test_migrate_playlist_isrc_search(mock_sleep, migrator, mock_searcher, mock_matcher):
-    """Test migration uses ISRC search when available."""
+    """A track carrying an ISRC still goes through title search only.
+
+    YouTube Music has no isrc: operator, so the ISRC lookup was removed. See
+    test_migration_does_not_issue_isrc_searches for the rationale.
+    """
     tracks = [{
         'name': 'Test',
         'artists': ['Artist'],
         'album': 'Album',
         'duration_ms': 200000,
-        'spotify_id': 'track1',
+        'id': 'track1',
         'isrc': 'USRC17607839'
     }]
     
@@ -277,13 +284,9 @@ def test_migrate_playlist_isrc_search(mock_sleep, migrator, mock_searcher, mock_
     
     report = migrator.migrate_playlist("Test", tracks)
     
-    # Verify ISRC search was used
-    mock_searcher.search_by_isrc.assert_called_once_with('USRC17607839')
-    
-    # Verify fuzzy search was NOT called
-    mock_searcher.search_track.assert_not_called()
-    
-    # Verify match succeeded
+    # ISRC search is no longer issued; the title search carries the match
+    mock_searcher.search_by_isrc.assert_not_called()
+    mock_searcher.search_track.assert_called_once()
     assert report['matched_tracks'] == 1
 
 
@@ -295,7 +298,7 @@ def test_migrate_playlist_isrc_fallback_to_fuzzy(mock_sleep, migrator, mock_sear
         'artists': ['Artist'],
         'album': 'Album',
         'duration_ms': 200000,
-        'spotify_id': 'track1',
+        'id': 'track1',
         'isrc': 'INVALIDISRC'
     }]
     
@@ -306,7 +309,7 @@ def test_migrate_playlist_isrc_fallback_to_fuzzy(mock_sleep, migrator, mock_sear
     report = migrator.migrate_playlist("Test", tracks)
     
     # Verify ISRC was tried first
-    mock_searcher.search_by_isrc.assert_called_once()
+    mock_searcher.search_by_isrc.assert_not_called()
     
     # Verify fuzzy search was used as fallback
     mock_searcher.search_track.assert_called_once()
@@ -544,7 +547,7 @@ def test_full_migration_workflow(mock_sleep, migrator, mock_ytmusic, mock_search
             'artists': ['Artist 1'],
             'album': 'Album 1',
             'duration_ms': 200000,
-            'spotify_id': 'sp1',
+            'id': 'sp1',
             'isrc': 'ISRC1'
         },
         {
@@ -552,7 +555,7 @@ def test_full_migration_workflow(mock_sleep, migrator, mock_ytmusic, mock_search
             'artists': ['Artist 2'],
             'album': 'Album 2',
             'duration_ms': 180000,
-            'spotify_id': 'sp2'
+            'id': 'sp2'
             # No ISRC
         }
     ]
@@ -574,14 +577,33 @@ def test_full_migration_workflow(mock_sleep, migrator, mock_ytmusic, mock_search
     assert report['success_rate'] == 100.0
     assert 'PL_NEW' in report['playlist_url']
     
-    # Verify ISRC was used for first track
-    mock_searcher.search_by_isrc.assert_called_once_with('ISRC1')
+    # ISRC lookup is no longer issued for either track
+    mock_searcher.search_by_isrc.assert_not_called()
     
-    # Verify fuzzy search was used for second track
-    mock_searcher.search_track.assert_called_once()
+    # Both tracks resolve through the title search
+    assert mock_searcher.search_track.call_count == 2
     
     # Verify tracks were cached
     assert mock_cache.cache_match.call_count == 2
     
     # Verify tracks were added to playlist
     mock_ytmusic.add_playlist_items.assert_called_once()
+
+
+def test_migration_does_not_issue_isrc_searches(migrator, mock_ytmusic, mock_searcher,
+                                                mock_cache, sample_tracks):
+    """YouTube Music has no isrc: search operator, so that lookup is dead weight.
+
+    Measured against the live API: the isrc: query returned zero results for all
+    12 tracks of a real playlist, while the title search matched 11. Issuing it
+    doubled the request count and the wall-clock time per track.
+    """
+    mock_cache.get_cached_match.return_value = None
+    mock_searcher.search_track.return_value = [
+        {'videoId': 'v1', 'title': 'Song One', 'artists': [{'name': 'Artist A'}],
+         'album': {'name': 'Album'}, 'duration_seconds': 200},
+    ]
+
+    migrator.migrate_playlist("No ISRC Please", sample_tracks)
+
+    mock_searcher.search_by_isrc.assert_not_called()

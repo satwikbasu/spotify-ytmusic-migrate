@@ -53,7 +53,8 @@ Set these environment variables for API credentials:
 # Spotify API (from https://developer.spotify.com/dashboard)
 export SPOTIFY_CLIENT_ID="your_spotify_client_id"
 export SPOTIFY_CLIENT_SECRET="your_spotify_client_secret"
-export SPOTIFY_REDIRECT_URI="http://localhost:8888/callback"
+# IMPORTANT: Use 127.0.0.1 NOT localhost (Spotify requirement as of Nov 2025)
+export SPOTIFY_REDIRECT_URI="http://127.0.0.1:8888/callback"
 
 # YouTube API (from https://console.cloud.google.com/)
 export YOUTUBE_CLIENT_ID="your_youtube_client_id"

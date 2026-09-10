@@ -114,7 +114,7 @@ def sample_spotify_playlists():
             'name': 'My Awesome Playlist',
             'tracks': [
                 {
-                    'spotify_id': 'track_001',
+                    'id': 'track_001',
                     'name': 'Blinding Lights',
                     'artists': ['The Weeknd'],
                     'album': 'After Hours',
@@ -122,7 +122,7 @@ def sample_spotify_playlists():
                     'isrc': 'USUG12000123'
                 },
                 {
-                    'spotify_id': 'track_002',
+                    'id': 'track_002',
                     'name': 'Levitating',
                     'artists': ['Dua Lipa'],
                     'album': 'Future Nostalgia',
@@ -130,7 +130,7 @@ def sample_spotify_playlists():
                     'isrc': 'USUG12001234'
                 },
                 {
-                    'spotify_id': 'track_003',
+                    'id': 'track_003',
                     'name': 'Save Your Tears',
                     'artists': ['The Weeknd'],
                     'album': 'After Hours',
@@ -138,7 +138,7 @@ def sample_spotify_playlists():
                     'isrc': 'USUG12002345'
                 },
                 {
-                    'spotify_id': 'track_004',
+                    'id': 'track_004',
                     'name': 'Good 4 U',
                     'artists': ['Olivia Rodrigo'],
                     'album': 'SOUR',
@@ -146,7 +146,7 @@ def sample_spotify_playlists():
                     'isrc': 'USUG12003456'
                 },
                 {
-                    'spotify_id': 'track_005',
+                    'id': 'track_005',
                     'name': 'Peaches',
                     'artists': ['Justin Bieber', 'Daniel Caesar', 'Giveon'],
                     'album': 'Justice',
@@ -154,7 +154,7 @@ def sample_spotify_playlists():
                     'isrc': 'USUG12004567'
                 },
                 {
-                    'spotify_id': 'track_006',
+                    'id': 'track_006',
                     'name': 'Stay',
                     'artists': ['The Kid LAROI', 'Justin Bieber'],
                     'album': 'F*ck Love 3',
@@ -162,7 +162,7 @@ def sample_spotify_playlists():
                     'isrc': 'USUG12005678'
                 },
                 {
-                    'spotify_id': 'track_007',
+                    'id': 'track_007',
                     'name': 'Montero',
                     'artists': ['Lil Nas X'],
                     'album': 'MONTERO',
@@ -170,7 +170,7 @@ def sample_spotify_playlists():
                     'isrc': 'USUG12006789'
                 },
                 {
-                    'spotify_id': 'track_008',
+                    'id': 'track_008',
                     'name': 'Kiss Me More',
                     'artists': ['Doja Cat', 'SZA'],
                     'album': 'Planet Her',
@@ -178,7 +178,7 @@ def sample_spotify_playlists():
                     'isrc': 'USUG12007890'
                 },
                 {
-                    'spotify_id': 'track_009',
+                    'id': 'track_009',
                     'name': 'drivers license',
                     'artists': ['Olivia Rodrigo'],
                     'album': 'SOUR',
@@ -186,7 +186,7 @@ def sample_spotify_playlists():
                     'isrc': 'USUG12008901'
                 },
                 {
-                    'spotify_id': 'track_010',
+                    'id': 'track_010',
                     'name': 'positions',
                     'artists': ['Ariana Grande'],
                     'album': 'Positions',
@@ -200,7 +200,7 @@ def sample_spotify_playlists():
             'name': 'Chill Vibes',
             'tracks': [
                 {
-                    'spotify_id': 'track_011',
+                    'id': 'track_011',
                     'name': 'Heat Waves',
                     'artists': ['Glass Animals'],
                     'album': 'Dreamland',
@@ -208,7 +208,7 @@ def sample_spotify_playlists():
                     'isrc': 'USUG12010123'
                 },
                 {
-                    'spotify_id': 'track_012',
+                    'id': 'track_012',
                     'name': 'Shivers',
                     'artists': ['Ed Sheeran'],
                     'album': '=',
@@ -216,7 +216,7 @@ def sample_spotify_playlists():
                     'isrc': 'USUG12011234'
                 },
                 {
-                    'spotify_id': 'track_013',
+                    'id': 'track_013',
                     'name': 'Bad Habits',
                     'artists': ['Ed Sheeran'],
                     'album': '=',
@@ -224,7 +224,7 @@ def sample_spotify_playlists():
                     'isrc': 'USUG12012345'
                 },
                 {
-                    'spotify_id': 'track_014',
+                    'id': 'track_014',
                     'name': 'Easy On Me',
                     'artists': ['Adele'],
                     'album': '30',
@@ -232,7 +232,7 @@ def sample_spotify_playlists():
                     'isrc': 'USUG12013456'
                 },
                 {
-                    'spotify_id': 'track_015',
+                    'id': 'track_015',
                     'name': 'Ghost',
                     'artists': ['Justin Bieber'],
                     'album': 'Justice',
@@ -240,7 +240,7 @@ def sample_spotify_playlists():
                     'isrc': 'USUG12014567'
                 },
                 {
-                    'spotify_id': 'track_016',
+                    'id': 'track_016',
                     'name': 'Cold Heart',
                     'artists': ['Elton John', 'Dua Lipa'],
                     'album': 'The Lockdown Sessions',
@@ -248,7 +248,7 @@ def sample_spotify_playlists():
                     'isrc': 'USUG12015678'
                 },
                 {
-                    'spotify_id': 'track_017',
+                    'id': 'track_017',
                     'name': 'Essence',
                     'artists': ['Wizkid', 'Tems'],
                     'album': 'Made in Lagos',
@@ -256,7 +256,7 @@ def sample_spotify_playlists():
                     'isrc': 'USUG12016789'
                 },
                 {
-                    'spotify_id': 'track_018',
+                    'id': 'track_018',
                     'name': 'Woman',
                     'artists': ['Doja Cat'],
                     'album': 'Planet Her',
@@ -264,7 +264,7 @@ def sample_spotify_playlists():
                     'isrc': 'USUG12017890'
                 },
                 {
-                    'spotify_id': 'track_019',
+                    'id': 'track_019',
                     'name': 'Happier Than Ever',
                     'artists': ['Billie Eilish'],
                     'album': 'Happier Than Ever',
@@ -272,7 +272,7 @@ def sample_spotify_playlists():
                     'isrc': 'USUG12018901'
                 },
                 {
-                    'spotify_id': 'track_020',
+                    'id': 'track_020',
                     'name': 'Beggin',
                     'artists': ['Måneskin'],
                     'album': 'Chosen',
@@ -506,8 +506,8 @@ def test_migration_with_cache_hits(
     
     for track in tracks_to_cache:
         cache_manager.cache_match(
-            spotify_id=track['spotify_id'],  # Fixed: use correct field name
-            youtube_id=f"yt_{track['spotify_id']}_cached",
+            spotify_id=track['id'],  # Fixed: use correct field name
+            youtube_id=f"yt_{track['id']}_cached",
             confidence=0.95
         )
     
@@ -723,7 +723,7 @@ def test_batch_addition_logic(
     large_playlist_tracks = []
     for i in range(1, 251):
         large_playlist_tracks.append({
-            'spotify_id': f'track_{i:03d}',  # Fixed: 'id' -> 'spotify_id'
+            'id': f'track_{i:03d}',  # Fixed: 'id' -> 'spotify_id'
             'name': f'Song {i}',
             'artists': [f'Artist {i}'],
             'album': f'Album {i}',

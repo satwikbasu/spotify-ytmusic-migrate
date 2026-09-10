@@ -701,3 +701,111 @@ def test_sanitize_emoji_strings(spotify_fetcher):
     only_emoji = "🎵🎶🔥"
     sanitized = spotify_fetcher._sanitize_string(only_emoji)
     assert sanitized is None  # Empty after removing emojis
+
+
+# ---------------------------------------------------------------------------
+# Regression: one malformed playlist must not stop the rest being cached (B2)
+# ---------------------------------------------------------------------------
+
+def _raw_playlist(pid, name, tracks=5):
+    """Build a raw Spotify API playlist record."""
+    return {
+        'id': pid,
+        'name': name,
+        'public': True,
+        'owner': {'display_name': 'tester', 'id': 'tester'},
+        'tracks': {'total': tracks},
+        'images': [],
+        'description': '',
+    }
+
+
+def test_malformed_playlist_does_not_stop_caching_the_rest():
+    """A record the cache rejects must skip only itself.
+
+    The real library contains a playlist with name=None. Because the caching
+    loop was wrapped in a single try, that one record aborted caching for every
+    playlist that came after it -- 190 fetched, 185 cached.
+    """
+    from unittest.mock import MagicMock
+    import tempfile, os
+    from src.fetchers.spotify_fetcher import SpotifyFetcher
+    from src.utils.cache_manager import CacheManager
+    from src.utils.rate_limiter import RateLimiter
+
+    bad = _raw_playlist('bad_1', None)          # name=None -> cache_playlist rejects
+    good_before = _raw_playlist('good_1', 'Before The Bad One')
+    good_after = _raw_playlist('good_2', 'After The Bad One')
+
+    client = MagicMock()
+    client.current_user_playlists.return_value = {
+        'items': [good_before, bad, good_after], 'next': None, 'total': 3,
+    }
+
+    cache = CacheManager(db_path=os.path.join(tempfile.mkdtemp(), 'b2.db'))
+    fetcher = SpotifyFetcher(client, RateLimiter(per_minute_limit=60, daily_limit=10000), cache)
+    fetcher.get_user_playlists(use_cache=False)
+
+    assert cache.get_cached_playlist('good_2', max_age_hours=24) is not None, (
+        "playlist after the malformed one was never cached"
+    )
+    assert cache.get_cache_stats()['playlists_count'] == 2
+
+
+def test_duplicate_playlists_are_returned_once():
+    """Spotify's offset paging can return the same playlist twice.
+
+    Measured on a real account: 195 items containing 193 unique IDs. Without
+    deduplication the migrator would create duplicate YouTube playlists and
+    spend twice the API budget on them.
+    """
+    from unittest.mock import MagicMock
+    import tempfile, os
+    from src.fetchers.spotify_fetcher import SpotifyFetcher
+    from src.utils.cache_manager import CacheManager
+    from src.utils.rate_limiter import RateLimiter
+
+    dupe = _raw_playlist('dupe_1', 'Appears Twice')
+    client = MagicMock()
+    client.current_user_playlists.return_value = {
+        'items': [dupe, _raw_playlist('uniq_1', 'Only Once'), dict(dupe)],
+        'next': None, 'total': 3,
+    }
+
+    cache = CacheManager(db_path=os.path.join(tempfile.mkdtemp(), 'b5.db'))
+    fetcher = SpotifyFetcher(client, RateLimiter(per_minute_limit=60, daily_limit=10000), cache)
+    playlists = fetcher.get_user_playlists(use_cache=False)
+
+    ids = [p['id'] for p in playlists]
+    assert len(ids) == len(set(ids)), f"duplicate playlist IDs returned: {ids}"
+    assert len(playlists) == 2
+
+
+def test_playlist_without_a_name_is_skipped():
+    """A record with name=None must not reach the migrator.
+
+    The real library contains one (id 5WoLlehPQTzoaNdIQgTrcC, 136 tracks,
+    owner=None). Left in, it reaches create_playlist(title=None) on YouTube.
+    """
+    from unittest.mock import MagicMock
+    import tempfile, os
+    from src.fetchers.spotify_fetcher import SpotifyFetcher
+    from src.utils.cache_manager import CacheManager
+    from src.utils.rate_limiter import RateLimiter
+
+    nameless = _raw_playlist('nameless_1', None, tracks=136)
+    nameless['owner'] = None
+
+    client = MagicMock()
+    client.current_user_playlists.return_value = {
+        'items': [nameless, _raw_playlist('fine_1', 'Perfectly Fine')],
+        'next': None, 'total': 2,
+    }
+
+    cache = CacheManager(db_path=os.path.join(tempfile.mkdtemp(), 'b6.db'))
+    fetcher = SpotifyFetcher(client, RateLimiter(per_minute_limit=60, daily_limit=10000), cache)
+    playlists = fetcher.get_user_playlists(use_cache=False)
+
+    returned_ids = [p['id'] for p in playlists]
+    assert 'nameless_1' not in returned_ids, "playlist with name=None was not skipped"
+    assert returned_ids == ['fine_1']

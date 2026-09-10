@@ -501,12 +501,6 @@ class WelcomeScreen(BaseScreen):
         self.app_state['youtube_client'] = self.youtube_client
         self.app_state['token_manager'] = self.token_manager
         
-        # TODO: Navigate to PlaylistSelectionScreen once implemented
-        # from src.ui.screens.playlist_selection_screen import PlaylistSelectionScreen
-        # self.navigate_to(PlaylistSelectionScreen, show_back=True, progress_text="Step 2 of 5")
-        
-        # For now, show success
-        self.show_success(
-            "Authentication complete! Playlist selection screen coming soon.",
-            title="Ready to Migrate"
-        )
+        # Navigate to PlaylistSelectionScreen
+        from src.ui.screens.playlist_selection_screen import PlaylistSelectionScreen
+        self.navigate_to(PlaylistSelectionScreen, show_back=True, progress_text="Step 2 of 5")

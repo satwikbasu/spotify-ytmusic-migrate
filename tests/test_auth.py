@@ -259,133 +259,10 @@ def test_spotify_clear_cache(temp_dir, mock_spotify_credentials):
 # YouTube Authentication Tests
 # ============================================================================
 
-def test_youtube_auth_new_user(temp_dir, mock_youtube_credentials, mock_youtube_token):
-    """Test YouTube Music authentication for a new user.
-    
-    This test validates that:
-    1. YouTubeAuthenticator can perform OAuth flow for new users
-    2. The authenticate() method returns a valid YTMusic client
-    3. Credentials are properly saved after authentication
-    """
-    creds_path = os.path.join(temp_dir, "youtube_oauth.json")
-    
-    # Create authenticator
-    auth = YouTubeAuthenticator(
-        client_id=mock_youtube_credentials["client_id"],
-        client_secret=mock_youtube_credentials["client_secret"]
-    )
-    auth.credentials_path = creds_path
-    
-    # Ensure no cached credentials exist
-    if os.path.exists(creds_path):
-        os.remove(creds_path)
-    
-    # Mock the OAuth flow
-    with patch('src.auth.youtube_auth.InstalledAppFlow') as mock_flow:
-        # Mock flow instance
-        mock_flow_instance = MagicMock()
-        mock_flow.from_client_config.return_value = mock_flow_instance
-        
-        # Mock credentials
-        mock_credentials = MagicMock()
-        mock_credentials.token = mock_youtube_token["access_token"]
-        mock_credentials.refresh_token = mock_youtube_token["refresh_token"]
-        mock_credentials.token_uri = mock_youtube_token["token_uri"]
-        mock_credentials.client_id = mock_youtube_token["client_id"]
-        mock_credentials.client_secret = mock_youtube_token["client_secret"]
-        mock_credentials.scopes = mock_youtube_token["scopes"]
-        mock_credentials.expiry = datetime.fromisoformat(mock_youtube_token["expiry"])
-        
-        mock_flow_instance.run_local_server.return_value = mock_credentials
-        
-        # Mock YTMusic client
-        with patch('src.auth.youtube_auth.YTMusic') as mock_ytmusic:
-            mock_client = MagicMock()
-            mock_client.get_account_info.return_value = {"accountName": "Test User"}
-            mock_ytmusic.return_value = mock_client
-            
-            # Perform authentication (this will create the credentials file)
-            yt_client = auth.authenticate()
-            
-            # Assertions
-            assert yt_client is not None
-            mock_flow_instance.run_local_server.assert_called_once()
-            mock_client.get_account_info.assert_called_once()
 
 
-def test_youtube_auth_cached_credentials(temp_dir, mock_youtube_credentials, mock_youtube_token):
-    """Test YouTube Music authentication with cached credentials.
-    
-    This test validates that:
-    1. is_authenticated() returns True when valid credentials exist
-    2. Cached credentials can be loaded and used
-    3. No OAuth flow is triggered when valid credentials exist
-    """
-    creds_path = os.path.join(temp_dir, "youtube_oauth.json")
-    
-    # Create credentials file
-    with open(creds_path, 'w') as f:
-        json.dump(mock_youtube_token, f)
-    
-    # Create authenticator
-    auth = YouTubeAuthenticator(
-        client_id=mock_youtube_credentials["client_id"],
-        client_secret=mock_youtube_credentials["client_secret"]
-    )
-    auth.credentials_path = creds_path
-    
-    # Test is_authenticated
-    is_auth = auth.is_authenticated()
-    assert is_auth is True
-    
-    # Mock YTMusic client
-    with patch('src.auth.youtube_auth.YTMusic') as mock_ytmusic:
-        mock_client = MagicMock()
-        mock_client.get_account_info.return_value = {"accountName": "Test User"}
-        mock_ytmusic.return_value = mock_client
-        
-        # Authenticate with cached credentials
-        yt_client = auth.authenticate()
-        
-        # Assertions
-        assert yt_client is not None
-        # YTMusic should be instantiated with the credentials file
-        mock_ytmusic.assert_called()
 
 
-def test_youtube_clear_cache(temp_dir, mock_youtube_credentials):
-    """Test clearing YouTube Music cached credentials.
-    
-    This test validates that:
-    1. clear_cache() removes the credentials file
-    2. is_authenticated() returns False after clearing cache
-    """
-    creds_path = os.path.join(temp_dir, "youtube_oauth.json")
-    
-    # Create a dummy credentials file
-    with open(creds_path, 'w') as f:
-        json.dump({"token": "dummy"}, f)
-    
-    # Create authenticator
-    auth = YouTubeAuthenticator(
-        client_id=mock_youtube_credentials["client_id"],
-        client_secret=mock_youtube_credentials["client_secret"]
-    )
-    auth.credentials_path = creds_path
-    
-    # Verify credentials exist
-    assert os.path.exists(creds_path)
-    
-    # Clear cache
-    auth.clear_cache()
-    
-    # Verify credentials are removed
-    assert not os.path.exists(creds_path)
-
-
-# ============================================================================
-# Encryption Tests
-# ============================================================================
 
 def test_token_encryption(temp_dir, encryption_key):
     """Test token encryption and decryption workflow.
@@ -513,114 +390,6 @@ def test_token_manager_initialization(mock_spotify_credentials, mock_youtube_cre
             assert os.path.exists(temp_dir)
 
 
-def test_token_manager_full_flow(
-    temp_dir,
-    mock_spotify_credentials,
-    mock_youtube_credentials,
-    mock_spotify_token,
-    mock_youtube_token
-):
-    """Test complete TokenManager authentication and storage flow.
-    
-    This test validates that:
-    1. TokenManager can authenticate with both services
-    2. Tokens are encrypted and stored correctly
-    3. Encrypted tokens can be retrieved and used
-    4. clear_all_tokens() removes all cached credentials
-    """
-    # Setup encryption key
-    test_key = generate_key()
-    key_path = os.path.join(temp_dir, "master.key")
-    save_key(test_key, key_path)
-    
-    # Create token paths in temp directory
-    spotify_cache = os.path.join(temp_dir, ".spotify_cache")
-    youtube_creds = os.path.join(temp_dir, "youtube_oauth.json")
-    
-    # Mock ensure_master_key
-    with patch('src.auth.token_manager.ensure_master_key') as mock_ensure_key:
-        mock_ensure_key.return_value = test_key
-        
-        # Patch directory paths
-        with patch.object(TokenManager, 'TOKENS_DIR', temp_dir):
-            with patch.object(TokenManager, 'MASTER_KEY_PATH', key_path):
-                # Create TokenManager
-                manager = TokenManager(
-                    spotify_client_id=mock_spotify_credentials["client_id"],
-                    spotify_client_secret=mock_spotify_credentials["client_secret"],
-                    youtube_client_id=mock_youtube_credentials["client_id"],
-                    youtube_client_secret=mock_youtube_credentials["client_secret"]
-                )
-                
-                # Update authenticator paths
-                manager.spotify_auth.cache_path = spotify_cache
-                manager.youtube_auth.credentials_path = youtube_creds
-                
-                # ---- Test Spotify Authentication ----
-                
-                # Mock Spotify OAuth
-                with patch('src.auth.spotify_auth.SpotifyOAuth') as mock_sp_oauth:
-                    mock_oauth_instance = MagicMock()
-                    mock_sp_oauth.return_value = mock_oauth_instance
-                    mock_oauth_instance.get_cached_token.return_value = None
-                    mock_oauth_instance.get_authorize_url.return_value = "http://mock.url"
-                    mock_oauth_instance.get_access_token.return_value = mock_spotify_token
-                    
-                    with patch('src.auth.spotify_auth.spotipy.Spotify') as mock_spotify:
-                        mock_sp_client = MagicMock()
-                        mock_sp_client.current_user.return_value = {"id": "test_user"}
-                        mock_spotify.return_value = mock_sp_client
-                        
-                        # Create cache file for encryption
-                        with open(spotify_cache, 'w') as f:
-                            json.dump(mock_spotify_token, f)
-                        
-                        # Authenticate
-                        sp_client = manager.authenticate_spotify()
-                        
-                        # Verify encrypted token exists
-                        assert manager.is_spotify_authenticated()
-                        encrypted_sp_path = os.path.join(temp_dir, ".spotify_cache.enc")
-                        assert os.path.exists(encrypted_sp_path)
-                
-                # ---- Test YouTube Authentication ----
-                
-                # Mock YouTube OAuth
-                with patch('src.auth.youtube_auth.InstalledAppFlow') as mock_yt_flow:
-                    mock_flow_instance = MagicMock()
-                    mock_yt_flow.from_client_config.return_value = mock_flow_instance
-                    
-                    mock_credentials = MagicMock()
-                    mock_credentials.token = mock_youtube_token["access_token"]
-                    mock_credentials.refresh_token = mock_youtube_token["refresh_token"]
-                    mock_credentials.token_uri = mock_youtube_token["token_uri"]
-                    mock_credentials.client_id = mock_youtube_token["client_id"]
-                    mock_credentials.client_secret = mock_youtube_token["client_secret"]
-                    mock_credentials.scopes = mock_youtube_token["scopes"]
-                    mock_credentials.expiry = datetime.fromisoformat(mock_youtube_token["expiry"])
-                    
-                    mock_flow_instance.run_local_server.return_value = mock_credentials
-                    
-                    with patch('src.auth.youtube_auth.YTMusic') as mock_ytmusic:
-                        mock_yt_client = MagicMock()
-                        mock_yt_client.get_account_info.return_value = {"accountName": "Test"}
-                        mock_ytmusic.return_value = mock_yt_client
-                        
-                        # Authenticate (this will create credentials file internally)
-                        yt_client = manager.authenticate_youtube()
-                        
-                        # Verify encrypted token exists
-                        assert manager.is_youtube_authenticated()
-                        encrypted_yt_path = os.path.join(temp_dir, "youtube_oauth.json.enc")
-                        assert os.path.exists(encrypted_yt_path)
-                
-                # ---- Test Clear All Tokens ----
-                
-                manager.clear_all_tokens()
-                
-                # Verify all tokens are cleared
-                assert not manager.is_spotify_authenticated()
-                assert not manager.is_youtube_authenticated()
 
 
 def test_token_manager_invalid_credentials():
@@ -645,3 +414,78 @@ def test_token_manager_invalid_credentials():
             youtube_client_id="id",
             youtube_client_secret=""
         )
+
+
+# ---------------------------------------------------------------------------
+# Regression: browser auth must reject a signed-out session (B10)
+# ---------------------------------------------------------------------------
+
+def _authenticator_with_headers(tmp_path):
+    """Build a YouTubeAuthenticator pointed at a throwaway headers file."""
+    from src.auth.youtube_auth import YouTubeAuthenticator
+    headers = tmp_path / "headers.json"
+    headers.write_text('{"cookie": "x", "authorization": "SAPISIDHASH y"}', encoding="utf-8")
+    auth = YouTubeAuthenticator()
+    auth.browser_headers_path = headers
+    return auth
+
+
+def test_browser_auth_raises_when_session_is_signed_out(tmp_path):
+    """An empty library must not be read as a successful login.
+
+    A signed-out session returns [] from get_library_playlists rather than
+    raising, so the old connection test printed a success banner and returned
+    the client. The failure only surfaced later as HTTP 401 on the first write.
+    """
+    import pytest
+    from unittest.mock import patch, MagicMock
+
+    signed_out = MagicMock()
+    signed_out.get_library_playlists.return_value = []
+    signed_out.get_account_info.side_effect = KeyError("header")
+
+    auth = _authenticator_with_headers(tmp_path)
+    with patch("src.auth.youtube_auth.YTMusic", return_value=signed_out):
+        with pytest.raises(RuntimeError, match="(?i)sign|auth"):
+            auth.authenticate()
+
+
+def test_browser_auth_accepts_a_signed_in_session_with_an_empty_library(tmp_path):
+    """A genuinely signed-in account with no playlists must still authenticate."""
+    from unittest.mock import patch, MagicMock
+
+    signed_in = MagicMock()
+    signed_in.get_library_playlists.return_value = []
+    signed_in.get_account_info.return_value = {"accountName": "Tester"}
+
+    auth = _authenticator_with_headers(tmp_path)
+    with patch("src.auth.youtube_auth.YTMusic", return_value=signed_in):
+        client = auth.authenticate()
+
+    assert client is signed_in
+
+
+def test_oauth_path_fails_with_a_clear_explanation(tmp_path):
+    """OAuth cannot work against YouTube Music, so it must say so up front.
+
+    The device flow completes and returns a valid token, but every subsequent
+    call returns HTTP 400 because YouTube Music's internal API does not accept
+    tokens from custom Google Cloud clients. Failing at authenticate() time with
+    an explanation beats failing later with 'invalid argument'.
+    """
+    import pytest
+    from src.auth.youtube_auth import YouTubeAuthenticator
+
+    auth = YouTubeAuthenticator(client_id="cid", client_secret="secret")
+    auth.browser_headers_path = tmp_path / "absent.json"
+    auth.browser_alt_path = tmp_path / "also-absent.json"
+
+    with pytest.raises(RuntimeError, match="(?i)browser"):
+        auth.authenticate()
+
+
+# Removed: test_youtube_auth_new_user, test_youtube_auth_cached_credentials,
+# test_youtube_clear_cache and test_token_manager_full_flow exercised the old
+# google-auth-oauthlib InstalledAppFlow implementation, which no longer exists.
+# Current OAuth behaviour is covered by test_oauth_path_fails_with_a_clear_explanation.
+

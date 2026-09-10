@@ -230,9 +230,9 @@ class PlaylistCard(ft.Container):
         self._on_click = on_click
         
         # Extract playlist info
-        name = playlist.get('name', 'Unknown Playlist')
-        track_count = playlist.get('tracks', 0)
-        thumbnail_url = playlist.get('thumbnail', None)
+        name = playlist.get('name') or 'Unknown Playlist'
+        track_count = playlist.get('tracks_count') or 0
+        thumbnail_url = playlist.get('image_url')
         
         # Create checkbox
         checkbox = ft.Checkbox(
@@ -271,14 +271,14 @@ class PlaylistCard(ft.Container):
                     value=name,
                     size=app_config.BODY_SIZE,
                     weight=ft.FontWeight.W_500,
-                    color=app_config.TEXT_COLOR_DARK,
+                    color=app_config.TEXT_COLOR_LIGHT,
                     overflow=ft.TextOverflow.ELLIPSIS,
                     max_lines=1
                 ),
                 ft.Text(
                     value=f"{track_count} tracks",
                     size=app_config.CAPTION_SIZE,
-                    color=app_config.TEXT_COLOR_DARK,
+                    color=app_config.TEXT_COLOR_LIGHT,
                     opacity=0.7
                 )
             ],
@@ -300,8 +300,8 @@ class PlaylistCard(ft.Container):
         
         super().__init__(
             content=card_row,
-            bgcolor=app_config.BACKGROUND_LIGHT,
-            border=ft.border.all(1, color=app_config.PRIMARY_COLOR if selected else "#E0E0E0"),
+            bgcolor="#2A2A2A",
+            border=ft.border.all(1, color=app_config.PRIMARY_COLOR if selected else "#404040"),
             border_radius=8,
             padding=12,
             ink=True,
@@ -317,7 +317,7 @@ class PlaylistCard(ft.Container):
         self.selected = e.control.value
         self.border = ft.border.all(
             1,
-            color=app_config.PRIMARY_COLOR if self.selected else "#E0E0E0"
+            color=app_config.PRIMARY_COLOR if self.selected else "#404040"
         )
         self.update()
         
@@ -330,7 +330,7 @@ class PlaylistCard(ft.Container):
         self.checkbox.value = self.selected
         self.border = ft.border.all(
             1,
-            color=app_config.PRIMARY_COLOR if self.selected else "#E0E0E0"
+            color=app_config.PRIMARY_COLOR if self.selected else "#404040"
         )
         self.update()
         
@@ -340,11 +340,11 @@ class PlaylistCard(ft.Container):
     def _handle_hover(self, e):
         """Handle hover effect."""
         if e.data == "true":
-            # Mouse entered
-            self.bgcolor = "#F5F5F5"
+            # Mouse entered - slightly lighter dark gray
+            self.bgcolor = "#353535"
         else:
-            # Mouse left
-            self.bgcolor = app_config.BACKGROUND_LIGHT
+            # Mouse left - back to original dark gray
+            self.bgcolor = "#2A2A2A"
         self.update()
 
 

@@ -39,20 +39,20 @@ def sample_playlists():
         {
             'id': 'playlist1',
             'name': 'Rock Classics',
-            'track_count': 50,
-            'thumbnail_url': 'http://example.com/thumb1.jpg'
+            'tracks_count': 50,
+            'image_url': 'http://example.com/thumb1.jpg'
         },
         {
             'id': 'playlist2',
             'name': 'Jazz Favorites',
-            'track_count': 30,
-            'thumbnail_url': 'http://example.com/thumb2.jpg'
+            'tracks_count': 30,
+            'image_url': 'http://example.com/thumb2.jpg'
         },
         {
             'id': 'playlist3',
             'name': 'Electronic Beats',
-            'track_count': 75,
-            'thumbnail_url': None
+            'tracks_count': 75,
+            'image_url': None
         }
     ]
 
@@ -124,7 +124,7 @@ class TestPlaylistSelectionScreenBuild:
         playlist_screen.build()
         
         assert isinstance(playlist_screen.playlist_list, ft.ListView)
-        assert playlist_screen.playlist_list.expand is True
+        assert playlist_screen.playlist_list.expand
 
 
 class TestPlaylistSelectionScreenLoadPlaylists:
@@ -231,7 +231,7 @@ class TestPlaylistSelectionScreenFooter:
     def test_update_footer_enables_start_button(self, playlist_screen):
         """Test start button is enabled when playlists selected."""
         playlist_screen.build()
-        playlist_screen.playlists = [{'id': 'p1', 'track_count': 10}]
+        playlist_screen.playlists = [{'id': 'p1', 'tracks_count': 10}]
         playlist_screen.selected_playlists = {'p1'}
         
         playlist_screen._update_footer()
@@ -392,7 +392,7 @@ class TestPlaylistSelectionScreenStartMigration:
         playlist_screen.build()
         # Create 51 playlists
         many_playlists = [
-            {'id': f'playlist{i}', 'name': f'Playlist {i}', 'track_count': 10}
+            {'id': f'playlist{i}', 'name': f'Playlist {i}', 'tracks_count': 10}
             for i in range(51)
         ]
         playlist_screen.playlists = many_playlists
@@ -497,7 +497,7 @@ class TestPlaylistSelectionScreenEdgeCases:
     def test_playlist_without_id(self, playlist_screen):
         """Test handling playlist without ID field."""
         playlist_screen.build()
-        bad_playlist = {'name': 'No ID Playlist', 'track_count': 10}
+        bad_playlist = {'name': 'No ID Playlist', 'tracks_count': 10}
         playlist_screen.playlists = [bad_playlist]
         playlist_screen.filtered_playlists = [bad_playlist]
         

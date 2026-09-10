@@ -77,8 +77,8 @@ class CacheManager:
             logger.info(f"Created cache directory: {db_dir}")
         
         try:
-            # Create database connection
-            self.connection = sqlite3.connect(self.db_path)
+            # Create database connection with thread safety enabled
+            self.connection = sqlite3.connect(self.db_path, check_same_thread=False)
             self.connection.row_factory = sqlite3.Row  # Enable column access by name
             
             logger.info(f"Connected to cache database: {self.db_path}")

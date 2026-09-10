@@ -159,6 +159,7 @@ class MigrationManager:
         # Initialize Spotify fetcher
         self.spotify_fetcher = SpotifyFetcher(
             spotify_client=spotify_client,
+            rate_limiter=self.rate_limiter,
             cache_manager=cache_manager
         )
         logger.info("Initialized SpotifyFetcher")
@@ -252,7 +253,7 @@ class MigrationManager:
         3. Add to background worker queue
         
         Progress callback signature:
-            progress_callback(playlist_name, current, total, track_name)
+            progress_callback(playlist_name, current, total, track_name, matched=0, failed=0)
         
         Args:
             playlists (List[Dict[str, Any]]): List of playlist dictionaries.
@@ -325,10 +326,10 @@ class MigrationManager:
                 
                 # Create progress wrapper that forwards to user callback
                 def create_progress_wrapper(pname: str):
-                    def wrapper(current: int, total: int, track_name: str):
+                    def wrapper(current: int, total: int, track_name: str, matched: int = 0, failed: int = 0):
                         if progress_callback:
                             try:
-                                progress_callback(pname, current, total, track_name)
+                                progress_callback(pname, current, total, track_name, matched, failed)
                             except Exception as e:
                                 logger.error(
                                     f"Progress callback error for '{pname}': {str(e)}"

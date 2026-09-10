@@ -22,13 +22,17 @@ class SpotifyAuthenticator:
     Attributes:
         client_id (str): Spotify application client ID.
         client_secret (str): Spotify application client secret.
-        redirect_uri (str): OAuth callback URL (default: http://localhost:8888/callback).
+        redirect_uri (str): OAuth callback URL (default: http://127.0.0.1:8888/callback).
         scope (str): Space-separated list of Spotify API scopes.
         cache_path (str): Path to the token cache file.
+    
+    Note:
+        As of November 2025, Spotify forbids 'localhost' in redirect URIs.
+        Use loopback IP literals: 127.0.0.1 (IPv4) or [::1] (IPv6).
     """
     
     REQUIRED_SCOPES = "playlist-read-private,playlist-read-collaborative,user-library-read"
-    DEFAULT_REDIRECT_URI = "http://localhost:8888/callback"
+    DEFAULT_REDIRECT_URI = "http://127.0.0.1:8888/callback"  # Changed from localhost (Nov 2025 requirement)
     MAX_RETRIES = 4
     
     def __init__(self, client_id: str, client_secret: str):

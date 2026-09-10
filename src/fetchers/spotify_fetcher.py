@@ -265,6 +265,7 @@ class SpotifyFetcher:
         playlists = []
         offset = 0
         total_fetched = 0
+        seen_ids = set()
         
         # Try to get from cache first (if enabled)
         if use_cache:
@@ -325,6 +326,24 @@ class SpotifyFetcher:
                             logger.debug(f"Skipping private playlist: {playlist.get('name')}")
                             continue
                         
+                        # Spotify occasionally returns records with no name or owner
+                        # (deleted or otherwise unavailable playlists). They cannot be
+                        # created on YouTube Music, so drop them here.
+                        if not playlist.get('name'):
+                            logger.warning(
+                                f"Skipping playlist with no name: id={playlist.get('id')!r} "
+                                f"tracks={playlist.get('tracks', {}).get('total')}"
+                            )
+                            continue
+                        
+                        # Spotify's offset paging can hand back the same playlist on
+                        # more than one page, so drop IDs we have already seen.
+                        playlist_id = playlist.get('id')
+                        if playlist_id in seen_ids:
+                            logger.debug(f"Skipping duplicate playlist: {playlist.get('name')}")
+                            continue
+                        seen_ids.add(playlist_id)
+                        
                         # Extract and store metadata
                         playlist_data = self.extract_playlist_metadata(playlist)
                         playlists.append(playlist_data)
@@ -364,13 +383,19 @@ class SpotifyFetcher:
             
             logger.info(f"Successfully fetched {len(playlists)} public playlists (from {total_fetched} total)")
             
-            # Cache all fetched playlists
-            try:
-                for playlist in playlists:
+            # Cache all fetched playlists. Each record is cached independently so
+            # that one malformed playlist cannot abort caching for the rest.
+            cached_count = 0
+            for playlist in playlists:
+                try:
                     self.cache_manager.cache_playlist(playlist)
-                logger.debug(f"Cached {len(playlists)} playlists")
-            except Exception as e:
-                logger.warning(f"Failed to cache playlists: {str(e)}")
+                    cached_count += 1
+                except Exception as e:
+                    logger.warning(
+                        f"Skipped caching playlist {playlist.get('id')!r} "
+                        f"({playlist.get('name')!r}): {str(e)}"
+                    )
+            logger.debug(f"Cached {cached_count} of {len(playlists)} playlists")
             
             return playlists
             

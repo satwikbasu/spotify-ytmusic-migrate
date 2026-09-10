@@ -188,7 +188,7 @@ class BackgroundWorker:
             migrator_func (Callable): Function to execute migration.
                 Signature: migrator_func(playlist_name, tracks, progress_callback) -> dict
             progress_callback (Optional[Callable]): Callback for progress updates.
-                Signature: progress_callback(current, total, track_name) -> None
+                Signature: progress_callback(current, total, track_name, matched=0, failed=0) -> None
         
         Returns:
             str: Unique job ID (UUID).
@@ -292,14 +292,32 @@ class BackgroundWorker:
                     
                     try:
                         # Create progress wrapper that updates database
-                        def progress_wrapper(current: int, total: int, track_name: str):
-                            # Update database
+                        def progress_wrapper(
+                            current: int,
+                            total: int,
+                            track_name: str,
+                            matched: int = 0,
+                            failed: int = 0
+                        ):
+                            # Update database with latest counters
                             self._update_job_progress(job_id, current, total)
                             
-                            # Call user callback if provided
+                            # Forward progress to caller if callback supplied
                             if job['progress_callback']:
                                 try:
-                                    job['progress_callback'](current, total, track_name)
+                                    job['progress_callback'](
+                                        current,
+                                        total,
+                                        track_name,
+                                        matched,
+                                        failed
+                                    )
+                                except TypeError:
+                                    # Backwards compatibility with 3-arg callbacks
+                                    try:
+                                        job['progress_callback'](current, total, track_name)
+                                    except Exception as e:
+                                        logger.error(f"Progress callback error: {str(e)}")
                                 except Exception as e:
                                     logger.error(f"Progress callback error: {str(e)}")
                         

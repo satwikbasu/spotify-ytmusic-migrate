@@ -243,70 +243,70 @@ def test_playlist_migration_success(
             'artists': ['The Weeknd'],
             'album': 'After Hours',
             'duration_ms': 200040,
-            'spotify_id': 'sp_track_1'
+            'id': 'sp_track_1'
         },
         {
             'name': 'Shape of You',
             'artists': ['Ed Sheeran'],
             'album': '÷',
             'duration_ms': 233713,
-            'spotify_id': 'sp_track_2'
+            'id': 'sp_track_2'
         },
         {
             'name': 'Someone Like You',
             'artists': ['Adele'],
             'album': '21',
             'duration_ms': 285000,
-            'spotify_id': 'sp_track_3'
+            'id': 'sp_track_3'
         },
         {
             'name': 'Bohemian Rhapsody',
             'artists': ['Queen'],
             'album': 'A Night at the Opera',
             'duration_ms': 354000,
-            'spotify_id': 'sp_track_4'
+            'id': 'sp_track_4'
         },
         {
             'name': 'Hotel California',
             'artists': ['Eagles'],
             'album': 'Hotel California',
             'duration_ms': 391000,
-            'spotify_id': 'sp_track_5'
+            'id': 'sp_track_5'
         },
         {
             'name': 'Imagine',
             'artists': ['John Lennon'],
             'album': 'Imagine',
             'duration_ms': 183000,
-            'spotify_id': 'sp_track_6'
+            'id': 'sp_track_6'
         },
         {
             'name': 'Smells Like Teen Spirit',
             'artists': ['Nirvana'],
             'album': 'Nevermind',
             'duration_ms': 301000,
-            'spotify_id': 'sp_track_7'
+            'id': 'sp_track_7'
         },
         {
             'name': 'Billie Jean',
             'artists': ['Michael Jackson'],
             'album': 'Thriller',
             'duration_ms': 294000,
-            'spotify_id': 'sp_track_8'
+            'id': 'sp_track_8'
         },
         {
             'name': "Sweet Child O' Mine",
             'artists': ["Guns N' Roses"],
             'album': 'Appetite for Destruction',
             'duration_ms': 356000,
-            'spotify_id': 'sp_track_9'
+            'id': 'sp_track_9'
         },
         {
             'name': 'Stairway to Heaven',
             'artists': ['Led Zeppelin'],
             'album': 'Led Zeppelin IV',
             'duration_ms': 482000,
-            'spotify_id': 'sp_track_10'
+            'id': 'sp_track_10'
         }
     ]
     
@@ -511,7 +511,7 @@ def test_playlist_migration_partial_failure(
             'artists': [f'Artist {i}'],
             'album': f'Album {i}',
             'duration_ms': 200000,
-            'spotify_id': f'sp_track_{i}'
+            'id': f'sp_track_{i}'
         }
         for i in range(1, 11)
     ]
@@ -594,7 +594,7 @@ def test_cache_usage(
             'artists': [f'Artist {i}'],
             'album': f'Album {i}',
             'duration_ms': 200000,
-            'spotify_id': f'sp_track_{i}'
+            'id': f'sp_track_{i}'
         }
         for i in range(1, 11)
     ]

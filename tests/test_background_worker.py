@@ -41,14 +41,14 @@ def sample_tracks():
             'artists': ['Artist 1'],
             'album': 'Album 1',
             'duration_ms': 200000,
-            'spotify_id': 'track1'
+            'id': 'track1'
         },
         {
             'name': 'Track 2',
             'artists': ['Artist 2'],
             'album': 'Album 2',
             'duration_ms': 180000,
-            'spotify_id': 'track2'
+            'id': 'track2'
         }
     ]
 
@@ -63,7 +63,7 @@ def test_init(worker, cache_manager):
     assert isinstance(worker.job_queue, type(worker.job_queue))
     assert isinstance(worker.is_running, threading.Event)
     assert worker.current_job is None
-    assert isinstance(worker.current_job_lock, threading.Lock)
+    assert isinstance(worker.current_job_lock, type(threading.Lock()))
     assert worker.worker_thread is None
     
     # Verify migrations table was created

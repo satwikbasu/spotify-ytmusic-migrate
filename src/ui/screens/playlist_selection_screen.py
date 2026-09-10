@@ -84,14 +84,14 @@ class PlaylistSelectionScreen(BaseScreen):
             "Select Playlists",
             size=app_config.HEADING_SIZE_LARGE,
             weight=ft.FontWeight.BOLD,
-            color=app_config.TEXT_COLOR_DARK
+            color=app_config.TEXT_COLOR_LIGHT
         )
         
         # Playlist count header
         self.header_text = ft.Text(
             "Loading playlists...",
             size=app_config.BODY_SIZE,
-            color=app_config.TEXT_COLOR_DARK,
+            color=app_config.TEXT_COLOR_LIGHT,
             opacity=0.7
         )
         
@@ -120,10 +120,11 @@ class PlaylistSelectionScreen(BaseScreen):
             hint_text="Search playlists...",
             prefix_icon=ft.Icons.SEARCH,
             border_radius=8,
-            bgcolor=app_config.BACKGROUND_LIGHT,
+            bgcolor="#2A2A2A",
             border_color=app_config.PRIMARY_COLOR,
             focused_border_color=app_config.PRIMARY_COLOR,
             cursor_color=app_config.PRIMARY_COLOR,
+            color=ft.Colors.WHITE,
             text_size=app_config.BODY_SIZE,
             on_change=self.on_search_change,
             expand=True
@@ -134,11 +135,11 @@ class PlaylistSelectionScreen(BaseScreen):
             alignment=ft.MainAxisAlignment.START
         )
         
-        # Playlist list (scrollable)
+        # Playlist list (scrollable) - must use expand=1 for proper height calculation
         self.playlist_list = ft.ListView(
             spacing=12,
-            padding=20,
-            expand=True,
+            padding=ft.padding.only(top=0, bottom=20, left=0, right=0),
+            expand=1,
             auto_scroll=False
         )
         
@@ -147,7 +148,7 @@ class PlaylistSelectionScreen(BaseScreen):
             "Selected: 0 playlists (Total: 0 tracks)",
             size=app_config.BODY_SIZE,
             weight=ft.FontWeight.W_500,
-            color=app_config.TEXT_COLOR_DARK
+            color=app_config.TEXT_COLOR_LIGHT
         )
         
         # Footer buttons
@@ -188,32 +189,36 @@ class PlaylistSelectionScreen(BaseScreen):
             padding=ft.padding.only(left=40, right=40, bottom=20, top=20)
         )
         
-        # Main content layout
-        content = ft.Container(
-            content=ft.Column(
-                controls=[
-                    ft.Container(
-                        content=ft.Column(
-                            controls=[
-                                title,
-                                ft.Container(height=8),
-                                self.header_text,
-                                ft.Container(height=24),
-                                action_buttons,
-                                ft.Container(height=16),
-                                search_row
-                            ],
-                            spacing=0
-                        ),
-                        padding=ft.padding.only(left=40, right=40, top=20)
+        # Main content layout - proper structure for scrolling
+        # Key: Column with expand, Container with expand for ListView
+        content = ft.Column(
+            controls=[
+                # Header section
+                ft.Container(
+                    content=ft.Column(
+                        controls=[
+                            title,
+                            ft.Container(height=8),
+                            self.header_text,
+                            ft.Container(height=24),
+                            action_buttons,
+                            ft.Container(height=16),
+                            search_row
+                        ],
+                        spacing=0
                     ),
-                    ft.Container(height=16),
-                    self.playlist_list,
-                    footer
-                ],
-                spacing=0,
-                expand=True
-            ),
+                    padding=ft.padding.only(left=40, right=40, top=20, bottom=16)
+                ),
+                # Scrollable area - Container with expand containing ListView
+                ft.Container(
+                    content=self.playlist_list,
+                    expand=True,
+                    padding=ft.padding.symmetric(horizontal=40)
+                ),
+                # Footer
+                footer
+            ],
+            spacing=0,
             expand=True
         )
         
@@ -229,6 +234,10 @@ class PlaylistSelectionScreen(BaseScreen):
         Shows loading indicator during fetch and error dialog on failure.
         """
         logger.info("Loading playlists from Spotify")
+        
+        # Wait a moment for UI to fully initialize
+        import asyncio
+        await asyncio.sleep(0.1)
         
         # Show loading
         self.show_loading(True, "Fetching playlists from Spotify...")
@@ -251,8 +260,8 @@ class PlaylistSelectionScreen(BaseScreen):
                 rate_limiter = self.app_state.get('rate_limiter')
                 if not rate_limiter:
                     rate_limiter = RateLimiter(
-                        max_requests_per_minute=60,
-                        max_daily_quota=10000
+                        per_minute_limit=60,
+                        daily_limit=10000
                     )
                     self.app_state['rate_limiter'] = rate_limiter
                 
@@ -314,7 +323,7 @@ class PlaylistSelectionScreen(BaseScreen):
                         ft.Text(
                             "No playlists found" if not self.search_query else "No playlists match your search",
                             size=app_config.BODY_SIZE,
-                            color=app_config.TEXT_COLOR_DARK,
+                            color=app_config.TEXT_COLOR_LIGHT,
                             opacity=0.6,
                             text_align=ft.TextAlign.CENTER
                         )
@@ -328,9 +337,13 @@ class PlaylistSelectionScreen(BaseScreen):
             self.playlist_list.controls.append(empty_message)
         else:
             # Add playlist cards
-            for playlist in self.filtered_playlists:
+            for i, playlist in enumerate(self.filtered_playlists):
                 playlist_id = playlist.get('id', '')
                 is_selected = playlist_id in self.selected_playlists
+                
+                # Debug: log first playlist data
+                if i == 0:
+                    logger.info(f"First playlist data: {playlist}")
                 
                 card = PlaylistCard(
                     playlist=playlist,
@@ -340,9 +353,12 @@ class PlaylistSelectionScreen(BaseScreen):
                 
                 self.playlist_list.controls.append(card)
         
-        # Update the list
-        if hasattr(self.playlist_list, 'page') and self.playlist_list.page:
-            self.playlist_list.update()
+        # Force update the page
+        try:
+            self.page.update()
+        except AssertionError:
+            # UI not fully initialized yet, skip update
+            logger.debug("UI not ready for update, skipping")
     
     def _update_header(self) -> None:
         """Update the header text with playlist count."""
@@ -354,8 +370,7 @@ class PlaylistSelectionScreen(BaseScreen):
         else:
             self.header_text.value = f"Found {total_count} public playlists"
         
-        if hasattr(self.header_text, 'page') and self.header_text.page:
-            self.header_text.update()
+        self.page.update()
     
     def _update_footer(self) -> None:
         """Update the footer with selection count and total tracks."""
@@ -365,7 +380,7 @@ class PlaylistSelectionScreen(BaseScreen):
         total_tracks = 0
         for playlist in self.playlists:
             if playlist.get('id') in self.selected_playlists:
-                total_tracks += playlist.get('track_count', 0)
+                total_tracks += playlist.get('tracks_count', 0)
         
         # Update summary text
         self.selection_summary.value = (
@@ -447,10 +462,10 @@ class PlaylistSelectionScreen(BaseScreen):
             # Show all playlists
             self.filtered_playlists = self.playlists.copy()
         else:
-            # Filter by name
+            # Filter by name - handle None values
             self.filtered_playlists = [
                 playlist for playlist in self.playlists
-                if self.search_query in playlist.get('name', '').lower()
+                if playlist.get('name') and self.search_query in playlist.get('name').lower()
             ]
         
         # Update UI
@@ -510,16 +525,9 @@ class PlaylistSelectionScreen(BaseScreen):
         
         logger.info(f"Stored {len(selected_playlist_objects)} playlists in app state")
         
-        # TODO: Navigate to MigrationProgressScreen once implemented
-        # from src.ui.screens.migration_progress_screen import MigrationProgressScreen
-        # self.navigate_to(MigrationProgressScreen, show_back=False, progress_text="Step 3 of 5")
-        
-        # For now, show success message
-        self.show_success(
-            f"Ready to migrate {len(selected_playlist_objects)} playlists!\n"
-            f"Migration progress screen coming soon.",
-            title="Migration Ready"
-        )
+        # Navigate to MigrationProgressScreen
+        from src.ui.screens.migration_progress_screen import MigrationProgressScreen
+        self.navigate_to(MigrationProgressScreen, show_back=False, progress_text="Step 3 of 5")
     
     def _handle_back(self, e) -> None:
         """Handle back button click.

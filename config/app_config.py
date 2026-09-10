@@ -102,11 +102,18 @@ SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
 """Spotify API client secret. Set via SPOTIFY_CLIENT_SECRET environment variable."""
 
-SPOTIFY_REDIRECT_URI = os.environ.get("SPOTIFY_REDIRECT_URI", "http://localhost:8888/callback")
-"""Spotify OAuth redirect URI. Defaults to localhost:8888/callback."""
+SPOTIFY_REDIRECT_URI = os.environ.get("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback")
+"""Spotify OAuth redirect URI. Defaults to 127.0.0.1:8888/callback.
+Note: As of Nov 2025, 'localhost' is forbidden - use loopback IP (127.0.0.1 or [::1])."""
+
+# YouTube OAuth Configuration
+# Note: YouTube Music uses device code flow (TV/Limited Input devices)
+# No redirect URI needed - authentication happens via device code on Google's page
 
 YOUTUBE_CLIENT_ID = os.environ.get("YOUTUBE_CLIENT_ID", "")
-"""YouTube API client ID. Set via YOUTUBE_CLIENT_ID environment variable."""
+"""YouTube API client ID. 
+IMPORTANT: Must be created with type 'TVs and Limited Input devices' in Google Cloud Console.
+Desktop app type will NOT work with ytmusicapi as of Nov 2024."""
 
 YOUTUBE_CLIENT_SECRET = os.environ.get("YOUTUBE_CLIENT_SECRET", "")
 """YouTube API client secret. Set via YOUTUBE_CLIENT_SECRET environment variable."""
@@ -222,6 +229,9 @@ def ensure_app_directories() -> None:
 
 def validate_credentials() -> dict:
     """Validate that required API credentials are set.
+    
+    IMPORTANT: YouTube credentials must be from OAuth Client ID type 
+    'TVs and Limited Input devices' (NOT 'Desktop app') as of Nov 2024.
     
     Returns:
         dict: Validation result with keys:

@@ -1,14 +1,14 @@
 # UI framework (Flutter-based Python desktop UI)
-flet>=0.20.0
+flet>=0.28,<0.29
 
 # Official Spotify API wrapper
 spotipy>=2.23.0
 
-# YouTube Music API wrapper (uses internal web API)
+# YouTube Music API wrapper with native OAuth support
 ytmusicapi>=1.4.0
 
-# Google OAuth2 implementation
-google-auth-oauthlib>=1.2.0
+# NOTE: google-auth-oauthlib is NO LONGER REQUIRED
+# ytmusicapi now handles OAuth natively via ytmusicapi.auth.oauth
 
 # Fast fuzzy string matching
 rapidfuzz>=3.5.0
@@ -24,3 +24,6 @@ pytest-cov>=4.1.0
 
 # Token encryption at rest
 cryptography>=41.0.0
+
+# Load environment variables from .env file
+python-dotenv>=1.0.0

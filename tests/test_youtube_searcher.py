@@ -207,14 +207,12 @@ def test_search_by_isrc_empty(mock_sleep, searcher, mock_ytmusic):
 @patch('src.searchers.youtube_searcher.time.sleep')
 def test_search_rate_limit_check(mock_sleep, searcher, mock_ytmusic, mock_rate_limiter):
     """Test rate limiter is checked before search."""
-    mock_rate_limiter.check_limit.return_value = False  # Rate limit exceeded
     mock_ytmusic.search.return_value = []
     
     results = searcher.search_track("Test", ["Artist"])
     
-    # Should check twice (initial + retry)
-    assert mock_rate_limiter.check_limit.call_count == 2
-    # Should not perform search if rate limited
+    # The limiter is consulted once, before the request goes out
+    assert mock_rate_limiter.check_limit.call_count == 1
     assert results == []
 
 

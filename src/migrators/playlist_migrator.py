@@ -176,8 +176,13 @@ class PlaylistMigrator:
             track_name = spotify_track.get('name', 'Unknown Track')
             
             try:
+                # Debug track data
+                
                 # Process the track
                 video_id, confidence = self._process_track(spotify_track)
+                
+                # Debug logging
+                logger.debug(f"[{idx}/{total_tracks}] _process_track returned: video_id={video_id}, confidence={confidence}")
                 
                 if video_id:
                     matched_video_ids.append(video_id)
@@ -201,14 +206,23 @@ class PlaylistMigrator:
                     'reason': f'Error: {str(e)}'
                 })
                 logger.error(
-                    f"[{idx}/{total_tracks}] Error processing {track_name}: {e}",
+                    f"[{idx}/{total_tracks}] EXCEPTION processing {track_name}: {type(e).__name__}: {e}",
                     exc_info=True
                 )
             
-            # Report progress
+            # Report progress with current match/fail counts
             if progress_callback:
                 try:
-                    progress_callback(idx, total_tracks, track_name)
+                    # Pass current matched and failed counts
+                    matched_so_far = len(matched_video_ids)
+                    failed_so_far = len(failed_tracks)
+                    progress_callback(idx, total_tracks, track_name, matched_so_far, failed_so_far)
+                except TypeError:
+                    # Fallback for old callback signature (3 params)
+                    try:
+                        progress_callback(idx, total_tracks, track_name)
+                    except Exception as e:
+                        logger.error(f"Progress callback error: {e}", exc_info=True)
                 except Exception as e:
                     logger.error(f"Progress callback error: {e}", exc_info=True)
         
@@ -261,10 +275,8 @@ class PlaylistMigrator:
         description = f"Migrated from Spotify by spotify-yt-migrate"
         
         try:
-            # Check rate limiter
-            if not self.rate_limiter.check_limit():
-                logger.warning("Rate limit exceeded when creating playlist")
-                time.sleep(5)  # Wait before retry
+            # Check rate limiter (blocks if necessary)
+            self.rate_limiter.check_limit()
             
             # Create playlist
             playlist_id = self.ytmusic_client.create_playlist(
@@ -303,7 +315,7 @@ class PlaylistMigrator:
             Tuple of (video_id, confidence_score)
             Returns (None, 0.0) if no match found
         """
-        spotify_id = spotify_track.get('spotify_id', '')
+        spotify_id = spotify_track.get('id', '')
         track_name = spotify_track.get('name', 'Unknown')
         artists = spotify_track.get('artists', [])
         isrc = spotify_track.get('isrc')
@@ -312,22 +324,20 @@ class PlaylistMigrator:
         cached_match = self.cache_manager.get_cached_match(spotify_id)
         if cached_match:
             logger.debug(f"Cache hit for: {track_name}")
-            return cached_match['youtube_video_id'], cached_match['confidence']
+            # Convert confidence back to percentage (0-100) to match search results
+            confidence_percentage = cached_match['confidence'] * 100.0
+            return cached_match['youtube_video_id'], confidence_percentage
         
         logger.debug(f"Cache miss for: {track_name}, searching YouTube Music...")
         
         # STEP 2: Search YouTube Music
         youtube_results = []
         
-        # Try ISRC search first (near 100% accuracy)
-        if isrc:
-            logger.debug(f"Trying ISRC search for: {track_name} (ISRC: {isrc})")
-            isrc_result = self.youtube_searcher.search_by_isrc(isrc)
-            if isrc_result:
-                youtube_results = [isrc_result]
-                logger.info(f"ISRC match found for: {track_name}")
+        # ISRC lookup is deliberately not attempted. YouTube Music has no isrc:
+        # search operator -- the query is treated as literal text and matched
+        # nothing for any of the 12 tracks in a real playlist, while doubling the
+        # request count. Title and artist search is the only path that works.
         
-        # Fallback to fuzzy search if ISRC didn't work
         if not youtube_results:
             logger.debug(f"Fuzzy searching for: {track_name}")
             youtube_results = self.youtube_searcher.search_track(track_name, artists)
@@ -397,10 +407,8 @@ class PlaylistMigrator:
             max_retries = 3
             for attempt in range(max_retries):
                 try:
-                    # Check rate limiter
-                    if not self.rate_limiter.check_limit():
-                        logger.warning("Rate limit exceeded, waiting...")
-                        time.sleep(5)
+                    # Check rate limiter (blocks if necessary)
+                    self.rate_limiter.check_limit()
                     
                     # Add batch to playlist
                     self.ytmusic_client.add_playlist_items(

@@ -170,16 +170,18 @@ class TestMigrationProgressScreenProgressUpdates:
         """Test that progress update calculates success/failure stats."""
         screen.last_update_time = 0
         
+        # BackgroundWorker.progress_wrapper supplies matched/failed explicitly
         screen.on_progress_update(
             playlist_name="Rock Classics",
             current=20,
             total=50,
-            track_name="Test Track"
+            track_name="Test Track",
+            matched=15,
+            failed=4
         )
         
-        # Should have some matched and failed counts
-        assert screen.matched_count > 0
-        assert screen.matched_count + screen.failed_count == 19  # current - 1
+        assert screen.matched_count == 15
+        assert screen.failed_count == 4
     
     def test_on_progress_update_throttles_updates(self, screen):
         """Test that updates are throttled to avoid UI lag."""
@@ -439,14 +441,15 @@ class TestMigrationProgressScreenMigrationComplete:
         screen.failed_count = 5
         screen.start_time = time.time()
         
-        with patch.object(screen, 'show_success') as mock_success:
+        # Completion stores the results and moves on to the results screen
+        with patch.object(screen, 'navigate_to') as mock_navigate:
             screen.on_migration_complete()
-            
-            mock_success.assert_called_once()
-            # Check message contains stats
-            message = mock_success.call_args[0][0]
-            assert "75" in message
-            assert "80" in message
+
+            mock_navigate.assert_called_once()
+            results = screen.app_state['migration_results']
+            assert results['matched_count'] == 75
+            assert results['failed_count'] == 5
+            assert results['total_tracks'] == 80
 
 
 class TestMigrationProgressScreenIntegration:

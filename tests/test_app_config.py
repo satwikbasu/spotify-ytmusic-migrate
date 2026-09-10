@@ -118,8 +118,9 @@ def test_api_credentials_from_env():
 
 
 def test_spotify_redirect_uri_default():
-    """Test Spotify redirect URI has default value."""
-    assert app_config.SPOTIFY_REDIRECT_URI == "http://localhost:8888/callback"
+    """Test Spotify redirect URI has default value (127.0.0.1, not localhost)."""
+    # Changed from localhost to 127.0.0.1 per Spotify Nov 2025 requirements
+    assert app_config.SPOTIFY_REDIRECT_URI == "http://127.0.0.1:8888/callback"
 
 
 # ============================================================================

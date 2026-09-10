@@ -196,16 +196,8 @@ class YouTubeSearcher:
         """
         for attempt in range(self.MAX_RETRIES):
             try:
-                # Check rate limiter before making request
-                if not self.rate_limiter.check_limit():
-                    logger.warning(
-                        f"Rate limit exceeded, waiting before {search_type} search: {query}"
-                    )
-                    # Rate limiter will handle the wait internally
-                    # Try again after the wait
-                    if not self.rate_limiter.check_limit():
-                        logger.error(f"Rate limit still exceeded after wait for: {query}")
-                        return []
+                # Check rate limiter before making request (blocks if necessary)
+                self.rate_limiter.check_limit()
                 
                 # Perform the search
                 logger.debug(f"Executing YouTube Music search (attempt {attempt + 1}): {query}")

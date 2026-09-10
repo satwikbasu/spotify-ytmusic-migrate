@@ -24,6 +24,14 @@ import os
 from pathlib import Path
 from typing import Optional
 
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # Load .env file from current directory
+    logging.info("Loaded environment variables from .env file")
+except ImportError:
+    logging.warning("python-dotenv not installed - .env file will not be loaded")
+
 # Import application modules
 from config import app_config
 from src.ui.screens.welcome_screen import WelcomeScreen

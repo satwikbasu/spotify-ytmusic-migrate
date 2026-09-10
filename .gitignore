@@ -142,6 +142,10 @@ oauth_token*
 credentials*.json
 token*.json
 
+# YouTube Music browser authentication
+headers.json
+browser.json
+
 # IDE-specific files
 # VSCode
 .vscode/
@@ -221,3 +225,7 @@ logs/
 spec.md
 test_spec.md
 TEST_GAP_ANALYSIS.md
+# Scratch OAuth artefacts
+oauth_test.json
+yt_oauth*.json
+.temp/

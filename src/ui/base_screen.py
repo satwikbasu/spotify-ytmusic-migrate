@@ -140,7 +140,8 @@ class BaseScreen(ABC):
         animated_content = ft.Container(
             content=content,
             animate_opacity=self.FADE_IN_DURATION,
-            opacity=0  # Start invisible
+            opacity=0,  # Start invisible
+            expand=True  # Allow content to expand and enable scrolling
         )
         
         # Create header row for back button and progress
@@ -292,7 +293,7 @@ class BaseScreen(ABC):
             content=ft.Text(
                 value=message,
                 size=app_config.BODY_SIZE,
-                color=app_config.TEXT_COLOR_DARK
+                color=ft.Colors.WHITE
             ),
             actions=[
                 ft.TextButton(
@@ -338,7 +339,7 @@ class BaseScreen(ABC):
             content=ft.Text(
                 value=message,
                 size=app_config.BODY_SIZE,
-                color=app_config.TEXT_COLOR_DARK
+                color=ft.Colors.WHITE
             ),
             actions=[
                 ft.TextButton(
@@ -412,14 +413,22 @@ class BaseScreen(ABC):
             if self._loading_overlay not in self.page.overlay:
                 self.page.overlay.append(self._loading_overlay)
             
-            self.page.update()
+            try:
+                self.page.update()
+            except AssertionError:
+                # UI not fully initialized yet, skip update
+                logger.debug("UI not ready for update, skipping")
         else:
             logger.debug("Hiding loading overlay")
             
             # Remove overlay from page
             if self._loading_overlay and self._loading_overlay in self.page.overlay:
                 self.page.overlay.remove(self._loading_overlay)
-                self.page.update()
+                try:
+                    self.page.update()
+                except AssertionError:
+                    # UI not fully initialized yet, skip update
+                    logger.debug("UI not ready for update, skipping")
     
     def show_confirmation(
         self,
@@ -475,12 +484,13 @@ class BaseScreen(ABC):
             title=ft.Text(
                 value=title,
                 size=app_config.HEADING_SIZE_SMALL,
-                weight=ft.FontWeight.BOLD
+                weight=ft.FontWeight.BOLD,
+                color=ft.Colors.WHITE
             ),
             content=ft.Text(
                 value=message,
                 size=app_config.BODY_SIZE,
-                color=app_config.TEXT_COLOR_DARK
+                color=ft.Colors.WHITE
             ),
             actions=[
                 ft.TextButton(
