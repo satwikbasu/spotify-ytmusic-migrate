@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Spotify -> YT Music Bridge (prototype)",
+  "version": "0.1.0",
+  "description": "Hands your signed-in YouTube Music session to the local migration engine. Prototype.",
+  "permissions": [
+    "cookies",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://music.youtube.com/*",
+    "http://127.0.0.1:8765/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Connect YouTube Music"
+  },
+  "background": {
+    "service_worker": "background.js"
+  }
+}
