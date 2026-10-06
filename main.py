@@ -21,6 +21,7 @@ import flet as ft
 import logging
 import sys
 import os
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -36,6 +37,7 @@ except ImportError:
 from config import app_config
 from src.ui.screens.welcome_screen import WelcomeScreen
 from src.utils.cache_manager import CacheManager
+from src.utils import power
 
 
 # ============================================================================
@@ -174,19 +176,252 @@ def cleanup_app_state(app_state: dict) -> None:
         logger.error(f"Error during cleanup: {e}", exc_info=True)
 
 
-def handle_window_event(e: ft.ControlEvent, app_state: dict) -> None:
+# ============================================================================
+# Background survival (CONTEXT_CONTRACT §4.3)
+#
+# The user clicks Start and walks away. Closing the window with an active job
+# must NOT kill the job: the window hides to a tray icon (or minimizes when no
+# tray is available) and the migration keeps running. The OS is also asked not
+# to sleep while a job is active. Nothing here edits MigrationManager; it only
+# reads its existing get_migration_status() and calls stop().
+# ============================================================================
+
+SLEEP_GUARD_INTERVAL_SECONDS = 5.0
+SLEEP_REASON = "Migrating playlists to YouTube Music"
+
+
+def is_migration_active(app_state: dict) -> bool:
+    """Return True if a migration job is running or queued.
+
+    Reads ``MigrationManager.get_migration_status()`` (its existing public API).
+    A job counts as active when the worker is running AND there is a current
+    job, an in-progress job, or anything still queued. Any error (manager
+    missing, stopped, or misbehaving) is treated as "not active" so that a
+    broken manager can never trap the user in a window that refuses to close.
+
+    Note: this relies on the progress screen publishing its manager under
+    ``app_state['migration_manager']``.
+    """
+    manager = app_state.get('migration_manager') if app_state else None
+    if manager is None:
+        return False
+    try:
+        status = manager.get_migration_status()
+        if not status.get('is_running', False):
+            return False
+        return bool(
+            status.get('current_job')
+            or status.get('in_progress_jobs', 0) > 0
+            or status.get('queued_jobs', 0) > 0
+            or status.get('queue_size', 0) > 0
+        )
+    except Exception as e:
+        logging.getLogger(__name__).debug(f"Could not read migration status: {e}")
+        return False
+
+
+class SleepGuard:
+    """Keep the OS awake while a migration is active.
+
+    A small daemon thread polls :func:`is_migration_active` and acquires or
+    releases an OS sleep inhibition (``src.utils.power``) to match. The same
+    thread does both, which Windows' ``SetThreadExecutionState`` requires.
+    """
+
+    def __init__(self, app_state: dict, interval: float = SLEEP_GUARD_INTERVAL_SECONDS):
+        self.app_state = app_state
+        self.interval = interval
+        self.handle: Optional[power.SleepInhibitor] = None
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._logger = logging.getLogger(__name__)
+
+    @property
+    def inhibiting(self) -> bool:
+        return self.handle is not None and self.handle.active
+
+    def tick(self) -> None:
+        """One poll: reconcile the inhibition with the migration state."""
+        try:
+            active = is_migration_active(self.app_state)
+            if active and self.handle is None:
+                self.handle = power.inhibit_sleep(SLEEP_REASON)
+                self._logger.info(f"Sleep guard engaged ({self.handle.backend})")
+            elif not active and self.handle is not None:
+                self.release()
+        except Exception as e:
+            self._logger.warning(f"Sleep guard tick failed: {e}")
+
+    def release(self) -> None:
+        if self.handle is not None:
+            power.release_sleep(self.handle)
+            self.handle = None
+            self._logger.info("Sleep guard released")
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            self.tick()
+        self.release()
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._run, name="sleep-guard", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=self.interval + 2)
+        # If the thread never ran (or is gone), release from here.
+        self.release()
+
+
+class TrayIcon:
+    """Optional system-tray / menubar icon shown while the window is hidden.
+
+    Uses ``pystray`` + ``Pillow`` if they are installed and a display exists.
+    Both are optional: :meth:`start` returns False (and the caller falls back
+    to minimizing) whenever the tray cannot be created. Never raises.
+    """
+
+    def __init__(self, on_show, on_quit, title: str = "Playlist Migrator"):
+        self.on_show = on_show
+        self.on_quit = on_quit
+        self.title = title
+        self._icon = None
+        self._logger = logging.getLogger(__name__)
+
+    @staticmethod
+    def _make_image():
+        from PIL import Image, ImageDraw  # optional dependency
+        size = 64
+        image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        draw.ellipse((4, 4, size - 4, size - 4), fill=(29, 185, 84, 255))
+        draw.polygon([(24, 18), (24, 46), (46, 32)], fill=(255, 255, 255, 255))
+        return image
+
+    def start(self) -> bool:
+        try:
+            import pystray  # importing can itself fail headless (no $DISPLAY)
+            menu = pystray.Menu(
+                pystray.MenuItem("Show", lambda icon, item: self.on_show(), default=True),
+                pystray.MenuItem("Quit (stops migration)", lambda icon, item: self.on_quit()),
+            )
+            self._icon = pystray.Icon(
+                "playlist_migrator", self._make_image(), self.title, menu
+            )
+            self._icon.run_detached()
+            self._logger.info("Tray icon shown; migration continues in background")
+            return True
+        except Exception as e:
+            self._icon = None
+            self._logger.info(f"System tray unavailable ({e}); falling back to minimize")
+            return False
+
+    def stop(self) -> None:
+        icon, self._icon = self._icon, None
+        if icon is not None:
+            try:
+                icon.stop()
+            except Exception as e:
+                self._logger.debug(f"Tray stop failed: {e}")
+
+
+def _set_window_hidden(page, hidden: bool) -> None:
+    """Hide/show the Flet window without destroying it. Never raises."""
+    try:
+        window = page.window
+        if hidden:
+            window.skip_task_bar = True
+            window.visible = False
+        else:
+            window.skip_task_bar = False
+            window.visible = True
+            window.minimized = False
+        page.update()
+        if not hidden:
+            try:
+                window.to_front()
+            except Exception:
+                pass
+    except Exception as e:
+        logging.getLogger(__name__).debug(f"Window visibility change failed: {e}")
+
+
+def show_window(page, app_state: dict) -> None:
+    """Restore the window from the tray (tray menu 'Show')."""
+    tray = app_state.pop('tray_icon', None)
+    if tray is not None:
+        tray.stop()
+    _set_window_hidden(page, False)
+
+
+def quit_application(page, app_state: dict) -> None:
+    """Really quit: stop the migration, release resources, destroy the window."""
+    logger = logging.getLogger(__name__)
+    logger.info("Quitting application")
+    tray = app_state.pop('tray_icon', None)
+    if tray is not None:
+        tray.stop()
+    cleanup_app_state(app_state)
+    if page is not None:
+        try:
+            page.window.destroy()
+        except Exception as e:
+            logger.debug(f"Window destroy failed: {e}")
+    logger.info("Application shutdown complete")
+
+
+def hide_to_background(page, app_state: dict) -> str:
+    """Keep the job running and get the window out of the way.
+
+    Returns ``'tray'`` if a tray icon was created, else ``'minimized'``.
+    """
+    logger = logging.getLogger(__name__)
+    logger.info("Migration active; hiding window instead of exiting")
+    tray = TrayIcon(
+        on_show=lambda: show_window(page, app_state),
+        on_quit=lambda: quit_application(page, app_state),
+    )
+    if tray.start():
+        app_state['tray_icon'] = tray
+        _set_window_hidden(page, True)
+        return 'tray'
+    # No tray: minimize and keep running (never crash, never kill the job).
+    try:
+        page.window.minimized = True
+        page.update()
+    except Exception as e:
+        logger.debug(f"Minimize failed: {e}")
+    return 'minimized'
+
+
+def handle_window_event(e: ft.ControlEvent, app_state: dict, page=None,
+                        sleep_guard: Optional["SleepGuard"] = None) -> None:
     """Handle window events (close, minimize, etc.).
-    
+
+    On close: if a migration is active, hide to tray / minimize and keep the
+    job alive; otherwise clean up and exit as before.
+
     Args:
         e (ft.ControlEvent): Window event.
         app_state (dict): Application state dictionary.
+        page (ft.Page, optional): Page whose window is being closed. Needed to
+            hide the window or to destroy it when ``prevent_close`` is set.
+        sleep_guard (SleepGuard, optional): Guard to stop on a real exit.
     """
     logger = logging.getLogger(__name__)
-    
+
     if e.data == "close":
         logger.info("Window close event received")
-        cleanup_app_state(app_state)
-        logger.info("Application shutdown complete")
+        if page is not None and is_migration_active(app_state):
+            hide_to_background(page, app_state)
+            return
+        if sleep_guard is not None:
+            sleep_guard.stop()
+        quit_application(page, app_state)
 
 
 # ============================================================================
@@ -286,9 +521,22 @@ def main(page: ft.Page) -> None:
         # Initialize application state
         app_state = initialize_app_state()
         
-        # Set up window event handler for cleanup
-        page.on_window_event = lambda e: handle_window_event(e, app_state)
-        
+        # Set up window event handler for cleanup / background survival.
+        # prevent_close makes the OS close button raise a "close" event instead
+        # of exiting, so an active migration can hide to the tray; when idle the
+        # handler destroys the window itself.
+        # Keep the OS awake while a job is active (CONTEXT_CONTRACT §4.3)
+        sleep_guard = SleepGuard(app_state)
+        sleep_guard.start()
+
+        handler = lambda e: handle_window_event(e, app_state, page, sleep_guard)
+        page.on_window_event = handler  # legacy attribute (kept for compatibility)
+        try:
+            page.window.prevent_close = True
+            page.window.on_event = handler
+        except Exception as e:
+            logger.warning(f"Could not configure window close handling: {e}")
+
         # Show welcome screen (first screen in the flow)
         logger.info("Creating WelcomeScreen...")
         welcome_screen = WelcomeScreen(page, app_state)

@@ -16,6 +16,11 @@ rapidfuzz>=3.5.0
 # Cross-platform desktop notifications
 plyer>=2.1.0
 
+# OPTIONAL: system tray icon so closing the window hides the app while a
+# migration keeps running. The app falls back to minimize if these are missing.
+pystray>=0.19.0
+Pillow>=10.0.0
+
 # Testing framework
 pytest>=7.4.0
 
