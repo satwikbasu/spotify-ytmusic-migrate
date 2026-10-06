@@ -13,6 +13,7 @@ from src.ui.components import AppButton, PlaylistCard, LoadingIndicator
 from src.fetchers.spotify_fetcher import SpotifyFetcher
 from src.utils.rate_limiter import RateLimiter
 from src.utils.cache_manager import CacheManager
+from src.utils import user_config
 from config import app_config
 
 
@@ -63,6 +64,8 @@ class PlaylistSelectionScreen(BaseScreen):
         self.selected_playlists: Set[str] = set()
         self.fetcher: Optional[SpotifyFetcher] = None
         self.search_query: str = ""
+        self.include_liked_songs: bool = True
+        self.liked_switch: Optional[ft.Switch] = None
         
         # UI component references
         self.header_text: Optional[ft.Text] = None
@@ -93,6 +96,21 @@ class PlaylistSelectionScreen(BaseScreen):
             size=app_config.BODY_SIZE,
             color=app_config.TEXT_COLOR_LIGHT,
             opacity=0.7
+        )
+        
+        # "Include Liked Songs" switch (remembered between runs)
+        self.include_liked_songs = user_config.get_include_liked_songs()
+        self.liked_switch = ft.Switch(
+            label="Include Liked Songs",
+            value=self.include_liked_songs,
+            active_color=app_config.PRIMARY_COLOR,
+            on_change=self.on_liked_songs_toggle
+        )
+        liked_hint = ft.Text(
+            "Your Liked Songs become a playlist called \"Liked Songs\" on YouTube Music.",
+            size=app_config.BODY_SIZE - 2,
+            color=app_config.TEXT_COLOR_LIGHT,
+            opacity=0.6
         )
         
         # Action buttons row
@@ -201,6 +219,9 @@ class PlaylistSelectionScreen(BaseScreen):
                             ft.Container(height=8),
                             self.header_text,
                             ft.Container(height=24),
+                            self.liked_switch,
+                            liked_hint,
+                            ft.Container(height=12),
                             action_buttons,
                             ft.Container(height=16),
                             search_row
@@ -274,7 +295,10 @@ class PlaylistSelectionScreen(BaseScreen):
                 logger.info("SpotifyFetcher initialized")
             
             # Fetch playlists
-            self.playlists = self.fetcher.get_user_playlists(use_cache=True)
+            self.playlists = self.fetcher.get_user_playlists(
+                use_cache=True,
+                include_liked_songs=self.include_liked_songs
+            )
             self.filtered_playlists = self.playlists.copy()
             
             logger.info(f"Fetched {len(self.playlists)} playlists")
@@ -282,6 +306,7 @@ class PlaylistSelectionScreen(BaseScreen):
             # Update UI
             self._update_playlist_list()
             self._update_header()
+            self._update_footer()
             
         except ValueError as e:
             logger.error(f"Configuration error: {e}")
@@ -396,6 +421,21 @@ class PlaylistSelectionScreen(BaseScreen):
             self.selection_summary.update()
         if hasattr(self.start_button, 'page') and self.start_button.page:
             self.start_button.update()
+    
+    def on_liked_songs_toggle(self, e) -> None:
+        """Handle the "Include Liked Songs" switch.
+
+        Saves the preference, drops Liked Songs from the selection when turned
+        off, and reloads the list so "Select All" / Everything follow the switch.
+        """
+        self.include_liked_songs = bool(e.control.value)
+        user_config.set_include_liked_songs(self.include_liked_songs)
+        logger.info(f"Include Liked Songs: {self.include_liked_songs}")
+        
+        if not self.include_liked_songs:
+            self.selected_playlists.discard(SpotifyFetcher.LIKED_SONGS_PLAYLIST_ID)
+        
+        self.page.run_task(self.load_playlists)
     
     def on_playlist_toggle(self, playlist_id: str) -> None:
         """Toggle playlist selection.

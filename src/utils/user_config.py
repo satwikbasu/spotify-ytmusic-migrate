@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 CONFIG_FILE_NAME = "user_config.json"
 SPOTIFY_CLIENT_ID_KEY = "spotify_client_id"
+INCLUDE_LIKED_SONGS_KEY = "include_liked_songs"
 
 _CLIENT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
@@ -115,3 +116,14 @@ def set_spotify_client_id(value: str) -> str:
         raise ValueError("Spotify Client ID must be 32 lowercase letters/numbers")
     set(SPOTIFY_CLIENT_ID_KEY, cleaned)
     return cleaned
+
+
+def get_include_liked_songs() -> bool:
+    """Whether Liked Songs is migrated as a playlist (default True)."""
+    value = get(INCLUDE_LIKED_SONGS_KEY, True)
+    return value if isinstance(value, bool) else True
+
+
+def set_include_liked_songs(value: bool) -> None:
+    """Remember the "Include Liked Songs" choice."""
+    set(INCLUDE_LIKED_SONGS_KEY, bool(value))
