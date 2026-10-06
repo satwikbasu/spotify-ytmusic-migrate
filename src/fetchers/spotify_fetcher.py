@@ -27,10 +27,12 @@ class SpotifyFetcher:
     with proper pagination, rate limiting, metadata extraction, and error handling.
     
     Features:
-    - Fetches all public playlists with pagination
+    - Fetches ALL of the user's playlists (public, private and collaborative)
+      with pagination -- "Select All" must mean the whole library
+    - Surfaces the user's saved tracks as a synthetic "Liked Songs" playlist
     - Fetches all tracks from playlists with pagination
     - Extracts comprehensive metadata
-    - Filters out private playlists
+    - Tolerates the Feb-2026 playlist-object rename (``tracks`` -> ``items``)
     - Handles null/missing fields gracefully
     - Rate limiting with configurable delays
     - Input validation and sanitization
@@ -45,7 +47,21 @@ class SpotifyFetcher:
     # Pagination constants
     PLAYLIST_PAGE_SIZE = 50
     TRACKS_PAGE_SIZE = 100
-    
+    # GET /me/tracks accepts limit 1-50 (Spotify Web API reference); asking
+    # for more is rejected with HTTP 400, so saved tracks page at 50.
+    SAVED_TRACKS_PAGE_SIZE = 50
+
+    # Synthetic playlist exposing the user's saved tracks ("Liked Songs").
+    # Spotify has no playlist object for these; they live behind
+    # /me/tracks. The id is deliberately not a valid Spotify playlist id so it
+    # can never collide with a real one, and it is stable across runs so the
+    # cache / migrations tables can key on it like any other playlist.
+    LIKED_SONGS_PLAYLIST_ID = 'liked_songs'
+    LIKED_SONGS_PLAYLIST_NAME = 'Liked Songs'
+
+    # Spotify dev-mode quota exhaustion comes back as a 429 with this reason.
+    QUOTA_EXCEEDED_REASON = 'QUOTA_EXCEEDED'
+
     # Rate limiting
     REQUEST_DELAY_SECONDS = 0.1  # 100ms between requests
     
@@ -131,7 +147,105 @@ class SpotifyFetcher:
             return False
         
         return True
-    
+
+    @staticmethod
+    def _playlist_track_total(playlist: Dict[str, Any]) -> int:
+        """Return the track count of a raw playlist object.
+
+        Spotify's Feb-2026 API migration renamed the playlist ``tracks`` field
+        to ``items``. Accept either spelling (dict with ``total``, or a plain
+        list) so the fetcher works against both old and new responses.
+        """
+        for key in ('tracks', 'items'):
+            value = playlist.get(key)
+            if isinstance(value, dict):
+                total = value.get('total')
+                if isinstance(total, int):
+                    return total
+            elif isinstance(value, list):
+                return len(value)
+        return 0
+
+    def _handle_429(self, error: SpotifyException) -> None:
+        """Route a Spotify 429 through the rate limiter, honouring Retry-After.
+
+        A dev-mode quota 429 carries ``reason: QUOTA_EXCEEDED``; it is logged
+        distinctly so the throttle cause is visible, but it is backed off the
+        same way (the limiter owns all waiting -- never sleep around it).
+        """
+        headers = getattr(error, 'headers', None) or {}
+        retry_after = headers.get('Retry-After')
+        try:
+            retry_after = int(retry_after) if retry_after is not None else None
+        except (TypeError, ValueError):
+            retry_after = None
+
+        if getattr(error, 'reason', None) == self.QUOTA_EXCEEDED_REASON:
+            logger.warning(
+                f"Spotify quota exceeded (reason={self.QUOTA_EXCEEDED_REASON}); "
+                f"backing off (Retry-After={retry_after})"
+            )
+        else:
+            logger.warning(f"Spotify rate limited (HTTP 429); backing off (Retry-After={retry_after})")
+
+        self.rate_limiter.handle_429(retry_after)
+
+    def _liked_songs_playlist(self) -> Optional[Dict[str, Any]]:
+        """Build the synthetic "Liked Songs" playlist entry.
+
+        Probes ``/me/tracks`` with ``limit=1`` purely to learn the total. Goes
+        through the rate limiter like every other call. Returns None when the
+        user has no saved tracks or the library cannot be read (e.g. the token
+        lacks ``user-library-read``) -- the real playlists are still returned.
+        """
+        while True:
+            try:
+                self.rate_limiter.check_limit()
+                response = self.spotify_client.current_user_saved_tracks(limit=1, offset=0)
+                self.rate_limiter.record_request()
+                self.rate_limiter.reset_backoff()
+                break
+            except SpotifyException as e:
+                if e.http_status == 429:
+                    self._handle_429(e)
+                    continue
+                logger.warning(
+                    f"Could not read saved tracks (HTTP {e.http_status}); "
+                    f"Liked Songs will not be offered: {str(e)}"
+                )
+                return None
+            except Exception as e:
+                logger.warning(f"Could not read saved tracks; Liked Songs will not be offered: {str(e)}")
+                return None
+
+        total = response.get('total') if isinstance(response, dict) else None
+        if not isinstance(total, int) or total <= 0:
+            logger.info("User has no saved tracks; skipping synthetic Liked Songs playlist")
+            return None
+
+        image_url = None
+        try:
+            first = (response.get('items') or [{}])[0].get('track') or {}
+            images = (first.get('album') or {}).get('images') or []
+            if images:
+                image_url = images[0].get('url')
+        except Exception:
+            image_url = None
+
+        return {
+            'id': self.LIKED_SONGS_PLAYLIST_ID,
+            'name': self.LIKED_SONGS_PLAYLIST_NAME,
+            'tracks_count': total,
+            'image_url': image_url,
+            'public': False,
+            'collaborative': False,
+            'synthetic': True,
+        }
+
+    def is_liked_songs(self, playlist_id: Optional[str]) -> bool:
+        """Return True if ``playlist_id`` is the synthetic Liked Songs playlist."""
+        return playlist_id == self.LIKED_SONGS_PLAYLIST_ID
+
     def extract_playlist_metadata(self, playlist: Dict[str, Any]) -> Dict[str, Any]:
         """Extract relevant metadata from a playlist object.
         
@@ -142,15 +256,22 @@ class SpotifyFetcher:
             Dict[str, Any]: Dictionary containing:
                 - id: Spotify playlist ID
                 - name: Playlist name (sanitized)
-                - tracks_count: Number of tracks in playlist
+                - tracks_count: Number of tracks in playlist (from ``tracks``
+                  or the post-Feb-2026 ``items`` field)
                 - image_url: URL of playlist cover image (or None)
+                - public: Spotify's public flag (False for private)
+                - collaborative: Spotify's collaborative flag
+                - synthetic: always False for real playlists
         """
         try:
             playlist_data = {
                 'id': playlist.get('id'),
                 'name': self._sanitize_string(playlist.get('name', 'Untitled Playlist')),
-                'tracks_count': playlist.get('tracks', {}).get('total', 0),
-                'image_url': None
+                'tracks_count': self._playlist_track_total(playlist),
+                'image_url': None,
+                'public': bool(playlist.get('public', False)),
+                'collaborative': bool(playlist.get('collaborative', False)),
+                'synthetic': False,
             }
             
             # Extract image URL (use first/largest image if available)
@@ -167,7 +288,10 @@ class SpotifyFetcher:
                 'id': playlist.get('id', 'unknown'),
                 'name': 'Unknown Playlist',
                 'tracks_count': 0,
-                'image_url': None
+                'image_url': None,
+                'public': False,
+                'collaborative': False,
+                'synthetic': False,
             }
     
     def extract_track_metadata(self, track: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -234,25 +358,31 @@ class SpotifyFetcher:
             logger.error(f"Error extracting track metadata: {str(e)}")
             return None
     
-    def get_user_playlists(self, use_cache: bool = True) -> List[Dict[str, Any]]:
-        """Fetch all public playlists for the current user.
-        
-        Implements pagination to fetch all playlists, filtering for only
-        public playlists as specified in requirements. Uses cache when available.
-        
+    def get_user_playlists(self, use_cache: bool = True,
+                           include_liked_songs: bool = True) -> List[Dict[str, Any]]:
+        """Fetch every playlist in the current user's library.
+
+        Returns public, private AND collaborative playlists (the auth layer
+        requests ``playlist-read-private`` / ``playlist-read-collaborative``),
+        plus a synthetic "Liked Songs" entry for the user's saved tracks. For a
+        non-technical user "Select All" must mean the whole library, so nothing
+        is filtered on visibility.
+
         Algorithm:
         1. Check cache for existing playlists (if use_cache=True)
         2. If cached and not expired, return cached playlists
         3. Otherwise, start with offset=0
         4. Fetch playlists with limit=50
-        5. Filter for public playlists only
-        6. Extract metadata for each playlist
-        7. If more pages exist (next != None), increment offset and repeat
-        8. Apply rate limiting between requests
+        5. Extract metadata for each playlist (dropping nameless/duplicate records)
+        6. If more pages exist (next != None), increment offset and repeat
+        7. Apply rate limiting between requests
+        8. Prepend the synthetic Liked Songs playlist (if the user has any)
         9. Cache all fetched playlists
-        
+
         Args:
             use_cache (bool): Whether to use cached data. Defaults to True.
+            include_liked_songs (bool): Whether to prepend the synthetic
+                Liked Songs playlist. Defaults to True.
         
         Returns:
             List[Dict[str, Any]]: List of playlist metadata dictionaries.
@@ -320,19 +450,14 @@ class SpotifyFetcher:
                     
                     for playlist in items:
                         total_fetched += 1
-                        
-                        # Filter for public playlists only
-                        if not playlist.get('public', False):
-                            logger.debug(f"Skipping private playlist: {playlist.get('name')}")
-                            continue
-                        
+
                         # Spotify occasionally returns records with no name or owner
                         # (deleted or otherwise unavailable playlists). They cannot be
                         # created on YouTube Music, so drop them here.
                         if not playlist.get('name'):
                             logger.warning(
                                 f"Skipping playlist with no name: id={playlist.get('id')!r} "
-                                f"tracks={playlist.get('tracks', {}).get('total')}"
+                                f"tracks={self._playlist_track_total(playlist)}"
                             )
                             continue
                         
@@ -347,24 +472,23 @@ class SpotifyFetcher:
                         # Extract and store metadata
                         playlist_data = self.extract_playlist_metadata(playlist)
                         playlists.append(playlist_data)
-                        logger.debug(f"Added public playlist: {playlist_data.get('name')}")
-                    
+                        visibility = 'public' if playlist_data.get('public') else 'private'
+                        logger.debug(f"Added {visibility} playlist: {playlist_data.get('name')}")
+
                     # Check if more pages exist
                     if response.get('next') is None:
                         logger.info(f"Reached end of playlists. Total fetched: {total_fetched}")
                         break
-                    
+
                     # Increment offset for next page
                     offset += self.PLAYLIST_PAGE_SIZE
-                    
+
                     # Rate limiting delay
                     time.sleep(self.REQUEST_DELAY_SECONDS)
-                    
+
                 except SpotifyException as e:
                     if e.http_status == 429:
-                        # Handle rate limiting
-                        retry_after = e.headers.get('Retry-After') if hasattr(e, 'headers') else None
-                        self.rate_limiter.handle_429(int(retry_after) if retry_after else None)
+                        self._handle_429(e)
                         # Retry the same offset
                         continue
                     elif e.http_status == 401:
@@ -381,8 +505,20 @@ class SpotifyFetcher:
                     logger.error(f"Unexpected error fetching playlists: {str(e)}")
                     raise RuntimeError(f"Failed to fetch playlists: {str(e)}") from e
             
-            logger.info(f"Successfully fetched {len(playlists)} public playlists (from {total_fetched} total)")
-            
+            private_count = sum(1 for p in playlists if not p.get('public'))
+            logger.info(
+                f"Successfully fetched {len(playlists)} playlists "
+                f"({private_count} private/collaborative) from {total_fetched} records"
+            )
+
+            # Liked Songs is not a playlist on Spotify; surface it as one so the
+            # selection and migration flow can treat it like any other.
+            if include_liked_songs:
+                liked = self._liked_songs_playlist()
+                if liked:
+                    playlists.insert(0, liked)
+                    logger.info(f"Added synthetic Liked Songs playlist ({liked['tracks_count']} tracks)")
+
             # Cache all fetched playlists. Each record is cached independently so
             # that one malformed playlist cannot abort caching for the rest.
             cached_count = 0
@@ -449,88 +585,30 @@ class SpotifyFetcher:
                 logger.warning(f"Failed to retrieve cached tracks: {str(e)}. Fetching from API.")
         
         logger.info(f"Fetching fresh tracks from Spotify API for playlist: {playlist_id}")
-        tracks = []
-        offset = 0
-        total_fetched = 0
-        
+
+        if self.is_liked_songs(playlist_id):
+            # Saved tracks live behind /me/tracks, not a playlist endpoint.
+            def fetch_page(offset: int) -> Dict[str, Any]:
+                return self.spotify_client.current_user_saved_tracks(
+                    limit=self.SAVED_TRACKS_PAGE_SIZE,
+                    offset=offset
+                )
+            page_size = self.SAVED_TRACKS_PAGE_SIZE
+        else:
+            # /playlists/{id}/items is the current endpoint; the old /tracks
+            # alias is deprecated. Response item shape is identical.
+            def fetch_page(offset: int) -> Dict[str, Any]:
+                return self.spotify_client.playlist_items(
+                    playlist_id,
+                    limit=self.TRACKS_PAGE_SIZE,
+                    offset=offset,
+                    additional_types=('track',)
+                )
+            page_size = self.TRACKS_PAGE_SIZE
+
         try:
-            while True:
-                try:
-                    # Check rate limits before request
-                    self.rate_limiter.check_limit()
-                    
-                    # Fetch tracks page
-                    logger.debug(f"Fetching tracks: playlist={playlist_id}, offset={offset}, limit={self.TRACKS_PAGE_SIZE}")
-                    response = self.spotify_client.playlist_tracks(
-                        playlist_id=playlist_id,
-                        limit=self.TRACKS_PAGE_SIZE,
-                        offset=offset
-                    )
-                    
-                    # Record successful request
-                    self.rate_limiter.record_request()
-                    self.rate_limiter.reset_backoff()
-                    
-                    # Process tracks
-                    items = response.get('items', [])
-                    if not items:
-                        logger.info(f"No more tracks found for playlist {playlist_id}")
-                        break
-                    
-                    for item in items:
-                        total_fetched += 1
-                        
-                        # Check if track exists (can be None for deleted tracks)
-                        track = item.get('track')
-                        if not track:
-                            logger.debug("Skipping null track (may be deleted)")
-                            continue
-                        
-                        # Extract and validate metadata
-                        track_data = self.extract_track_metadata(track)
-                        if track_data:
-                            tracks.append(track_data)
-                            logger.debug(f"Added track: {track_data.get('name')} by {', '.join(track_data.get('artists', []))}")
-                        else:
-                            logger.debug("Skipped invalid track")
-                    
-                    # Check if more pages exist
-                    if response.get('next') is None:
-                        logger.info(f"Reached end of tracks for playlist {playlist_id}. Total fetched: {total_fetched}")
-                        break
-                    
-                    # Increment offset for next page
-                    offset += self.TRACKS_PAGE_SIZE
-                    
-                    # Rate limiting delay
-                    time.sleep(self.REQUEST_DELAY_SECONDS)
-                    
-                except SpotifyException as e:
-                    if e.http_status == 429:
-                        # Handle rate limiting
-                        retry_after = e.headers.get('Retry-After') if hasattr(e, 'headers') else None
-                        self.rate_limiter.handle_429(int(retry_after) if retry_after else None)
-                        # Retry the same offset
-                        continue
-                    elif e.http_status == 404:
-                        logger.warning(f"Playlist {playlist_id} not found (may be deleted)")
-                        break  # Exit gracefully for deleted playlists
-                    elif e.http_status == 401:
-                        logger.error("Authentication error. Token may be expired.")
-                        raise
-                    elif e.http_status == 403:
-                        logger.warning(f"Access denied for playlist {playlist_id} (may be private)")
-                        break  # Exit gracefully for private playlists
-                    else:
-                        logger.error(f"Spotify API error (HTTP {e.http_status}): {str(e)}")
-                        raise
-                
-                except Exception as e:
-                    logger.error(f"Unexpected error fetching tracks: {str(e)}")
-                    raise RuntimeError(f"Failed to fetch tracks for playlist {playlist_id}: {str(e)}") from e
-            
-            logger.info(f"Successfully fetched {len(tracks)} valid tracks (from {total_fetched} total) for playlist {playlist_id}")
-            
+            tracks = self._fetch_track_pages(playlist_id, fetch_page, page_size)
+
             # Cache all fetched tracks
             if tracks:
                 try:
@@ -538,13 +616,101 @@ class SpotifyFetcher:
                     logger.debug(f"Cached {len(tracks)} tracks for playlist {playlist_id}")
                 except Exception as e:
                     logger.warning(f"Failed to cache tracks: {str(e)}")
-            
+
             return tracks
-            
+
         except Exception as e:
             logger.error(f"Fatal error in get_playlist_tracks: {str(e)}")
             raise
-    
+
+    def _fetch_track_pages(self, playlist_id: str, fetch_page, page_size: int) -> List[Dict[str, Any]]:
+        """Page through a track-list endpoint and extract valid track metadata.
+
+        Shared by real playlists (``playlist_items``) and the synthetic Liked
+        Songs playlist (``current_user_saved_tracks``); both return pages of
+        ``{'items': [{'track': {...}}, ...], 'next': ...}``.
+
+        Args:
+            playlist_id: Id used for logging and error handling.
+            fetch_page: Callable ``offset -> response dict`` performing the call.
+            page_size: Items per page; drives the offset increment.
+        """
+        tracks: List[Dict[str, Any]] = []
+        offset = 0
+        total_fetched = 0
+
+        while True:
+            try:
+                # Check rate limits before request
+                self.rate_limiter.check_limit()
+
+                logger.debug(f"Fetching tracks: playlist={playlist_id}, offset={offset}, limit={page_size}")
+                response = fetch_page(offset)
+
+                # Record successful request
+                self.rate_limiter.record_request()
+                self.rate_limiter.reset_backoff()
+
+                # Process tracks
+                items = response.get('items', [])
+                if not items:
+                    logger.info(f"No more tracks found for playlist {playlist_id}")
+                    break
+
+                for item in items:
+                    total_fetched += 1
+
+                    # Check if track exists (can be None for deleted tracks).
+                    # Accept the post-Feb-2026 'item' spelling as well.
+                    track = item.get('track') or item.get('item')
+                    if not track:
+                        logger.debug("Skipping null track (may be deleted)")
+                        continue
+
+                    # Extract and validate metadata
+                    track_data = self.extract_track_metadata(track)
+                    if track_data:
+                        tracks.append(track_data)
+                        logger.debug(f"Added track: {track_data.get('name')} by {', '.join(track_data.get('artists', []))}")
+                    else:
+                        logger.debug("Skipped invalid track")
+
+                # Check if more pages exist
+                if response.get('next') is None:
+                    logger.info(f"Reached end of tracks for playlist {playlist_id}. Total fetched: {total_fetched}")
+                    break
+
+                # Increment offset for next page
+                offset += page_size
+
+                # Rate limiting delay
+                time.sleep(self.REQUEST_DELAY_SECONDS)
+
+            except SpotifyException as e:
+                if e.http_status == 429:
+                    self._handle_429(e)
+                    # Retry the same offset
+                    continue
+                elif e.http_status == 404:
+                    logger.warning(f"Playlist {playlist_id} not found (may be deleted)")
+                    break  # Exit gracefully for deleted playlists
+                elif e.http_status == 401:
+                    logger.error("Authentication error. Token may be expired.")
+                    raise
+                elif e.http_status == 403:
+                    logger.warning(f"Access denied for playlist {playlist_id} (missing scope or not shared with user)")
+                    break  # Exit gracefully for inaccessible playlists
+                else:
+                    logger.error(f"Spotify API error (HTTP {e.http_status}): {str(e)}")
+                    raise
+
+            except Exception as e:
+                logger.error(f"Unexpected error fetching tracks: {str(e)}")
+                raise RuntimeError(f"Failed to fetch tracks for playlist {playlist_id}: {str(e)}") from e
+
+        logger.info(f"Successfully fetched {len(tracks)} valid tracks (from {total_fetched} total) for playlist {playlist_id}")
+        return tracks
+
     def get_all_playlists_with_tracks(self) -> List[Dict[str, Any]]:
         """Fetch all playlists and their tracks in one operation.
         

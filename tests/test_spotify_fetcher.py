@@ -12,6 +12,7 @@ from unittest.mock import Mock, MagicMock, patch, call
 from datetime import datetime, timedelta
 
 import pytest
+from spotipy.exceptions import SpotifyException
 
 from src.fetchers.spotify_fetcher import SpotifyFetcher
 from src.utils.rate_limiter import RateLimiter
@@ -78,6 +79,9 @@ def mock_spotify_client():
     """
     client = Mock()
     client.current_user.return_value = {'id': 'test_user', 'display_name': 'Test User'}
+    # Default: user has no saved tracks, so no synthetic Liked Songs entry is
+    # added. Tests exercising Liked Songs override this.
+    client.current_user_saved_tracks.return_value = create_mock_saved_tracks_response([], total=0)
     return client
 
 
@@ -178,6 +182,20 @@ def create_mock_playlists_response(playlists: list, has_next: bool = False) -> d
     }
 
 
+def create_mock_saved_tracks_response(tracks: list, total: int = None,
+                                      has_next: bool = False) -> dict:
+    """Create a mock GET /me/tracks (saved tracks) API response.
+
+    Shape matches the playlist-items response: each item wraps a ``track``.
+    ``total`` is the library-wide count Spotify reports on every page.
+    """
+    return {
+        'items': [{'added_at': '2024-01-01T00:00:00Z', 'track': track} for track in tracks],
+        'next': 'https://api.spotify.com/v1/me/tracks?offset=50' if has_next else None,
+        'total': len(tracks) if total is None else total
+    }
+
+
 def create_mock_tracks_response(tracks: list, has_next: bool = False) -> dict:
     """Create a mock playlist tracks API response.
     
@@ -238,41 +256,271 @@ def test_get_user_playlists_pagination(spotify_fetcher, mock_spotify_client, rat
     
     # Verify API was called 3 times (once per page)
     assert mock_spotify_client.current_user_playlists.call_count == 3
-    
-    # Verify rate limiter recorded 3 requests
-    # Note: First request doesn't record before fetching, only after
-    assert rate_limiter.daily_operations == 3
+
+    # Verify every call went through the rate limiter: 3 playlist pages plus
+    # the single /me/tracks probe that sizes the Liked Songs entry.
+    assert mock_spotify_client.current_user_saved_tracks.call_count == 1
+    assert rate_limiter.daily_operations == 4
 
 
-def test_filter_public_playlists(spotify_fetcher, mock_spotify_client):
-    """Test that only public playlists are returned.
-    
-    This test validates that:
-    1. Private playlists are filtered out
-    2. Public playlists are included
-    3. Filtering happens before metadata extraction
+def test_private_and_collaborative_playlists_are_included(spotify_fetcher, mock_spotify_client):
+    """Private and collaborative playlists must be returned, in API order.
+
+    Most personal playlists are private. The old public-only filter made
+    "Select All" migrate almost nothing (contract §4.3). The token already has
+    playlist-read-private / playlist-read-collaborative, so nothing is filtered
+    on visibility.
     """
-    # Create mix of public and private playlists
+    collab = create_mock_playlist('collab1', 'Shared With Friends', is_public=False)
+    collab['collaborative'] = True
     playlists = [
         create_mock_playlist('pub1', 'Public Playlist 1', is_public=True),
         create_mock_playlist('priv1', 'Private Playlist 1', is_public=False),
-        create_mock_playlist('pub2', 'Public Playlist 2', is_public=True),
+        collab,
         create_mock_playlist('priv2', 'Private Playlist 2', is_public=False),
-        create_mock_playlist('pub3', 'Public Playlist 3', is_public=True),
+        create_mock_playlist('pub2', 'Public Playlist 2', is_public=True),
     ]
-    
-    # Mock API response
     mock_spotify_client.current_user_playlists.return_value = create_mock_playlists_response(playlists)
-    
-    # Fetch playlists
+
     result = spotify_fetcher.get_user_playlists(use_cache=False)
-    
-    # Assertions
-    assert len(result) == 3  # Only 3 public playlists
-    assert all('Public' in p['name'] for p in result)
-    assert result[0]['id'] == 'pub1'
-    assert result[1]['id'] == 'pub2'
-    assert result[2]['id'] == 'pub3'
+
+    assert [p['id'] for p in result] == ['pub1', 'priv1', 'collab1', 'priv2', 'pub2']
+    by_id = {p['id']: p for p in result}
+    assert by_id['pub1']['public'] is True
+    assert by_id['priv1']['public'] is False
+    assert by_id['collab1']['collaborative'] is True
+    assert all(p['synthetic'] is False for p in result)
+    # Existing callers still get the keys they rely on
+    for p in result:
+        assert {'id', 'name', 'tracks_count', 'image_url'} <= set(p)
+
+
+def test_private_playlist_with_public_field_missing_is_included(spotify_fetcher, mock_spotify_client):
+    """Spotify returns public=None for some private playlists; keep them."""
+    playlist = create_mock_playlist('priv_none', 'Visibility Unknown', is_public=True)
+    playlist['public'] = None
+    mock_spotify_client.current_user_playlists.return_value = create_mock_playlists_response([playlist])
+
+    result = spotify_fetcher.get_user_playlists(use_cache=False)
+
+    assert [p['id'] for p in result] == ['priv_none']
+    assert result[0]['public'] is False
+
+
+# ============================================================================
+# Synthetic "Liked Songs" playlist
+# ============================================================================
+
+def test_liked_songs_appears_as_synthetic_playlist(spotify_fetcher, mock_spotify_client, cache_manager):
+    """Saved tracks surface as a 'Liked Songs' playlist, first in the list."""
+    first = create_mock_track('t1', 'First Liked', ['Artist'], 'Album')
+    first['album']['images'] = [{'url': 'https://example.com/liked.jpg'}]
+    mock_spotify_client.current_user_saved_tracks.return_value = (
+        create_mock_saved_tracks_response([first], total=1234)
+    )
+    mock_spotify_client.current_user_playlists.return_value = create_mock_playlists_response([
+        create_mock_playlist('pl1', 'Real Playlist', is_public=False),
+    ])
+
+    result = spotify_fetcher.get_user_playlists(use_cache=False)
+
+    assert [p['id'] for p in result] == [SpotifyFetcher.LIKED_SONGS_PLAYLIST_ID, 'pl1']
+    liked = result[0]
+    assert liked['name'] == 'Liked Songs'
+    assert liked['tracks_count'] == 1234
+    assert liked['image_url'] == 'https://example.com/liked.jpg'
+    assert liked['synthetic'] is True
+    assert liked['public'] is False
+    assert spotify_fetcher.is_liked_songs(liked['id'])
+
+    # Probe was a single, minimal page
+    mock_spotify_client.current_user_saved_tracks.assert_called_once_with(limit=1, offset=0)
+    # Cached like any other playlist so the selection screen / migrations can key on it
+    assert cache_manager.get_cached_playlist(SpotifyFetcher.LIKED_SONGS_PLAYLIST_ID, max_age_hours=24) is not None
+
+
+def test_liked_songs_omitted_when_user_has_none(spotify_fetcher, mock_spotify_client):
+    """An empty library must not produce an empty synthetic playlist."""
+    mock_spotify_client.current_user_playlists.return_value = create_mock_playlists_response([
+        create_mock_playlist('pl1', 'Real Playlist'),
+    ])
+
+    result = spotify_fetcher.get_user_playlists(use_cache=False)
+
+    assert [p['id'] for p in result] == ['pl1']
+
+
+def test_liked_songs_can_be_excluded(spotify_fetcher, mock_spotify_client):
+    """include_liked_songs=False skips the /me/tracks probe entirely."""
+    mock_spotify_client.current_user_playlists.return_value = create_mock_playlists_response([
+        create_mock_playlist('pl1', 'Real Playlist'),
+    ])
+
+    result = spotify_fetcher.get_user_playlists(use_cache=False, include_liked_songs=False)
+
+    assert [p['id'] for p in result] == ['pl1']
+    assert not mock_spotify_client.current_user_saved_tracks.called
+
+
+def test_liked_songs_probe_failure_does_not_lose_real_playlists(spotify_fetcher, mock_spotify_client):
+    """A 403 on /me/tracks (missing scope) drops only Liked Songs."""
+    mock_spotify_client.current_user_saved_tracks.side_effect = SpotifyException(
+        http_status=403, code=-1, msg='Insufficient client scope'
+    )
+    mock_spotify_client.current_user_playlists.return_value = create_mock_playlists_response([
+        create_mock_playlist('pl1', 'Real Playlist'),
+    ])
+
+    result = spotify_fetcher.get_user_playlists(use_cache=False)
+
+    assert [p['id'] for p in result] == ['pl1']
+
+
+def test_liked_songs_probe_honours_429(spotify_fetcher, mock_spotify_client, rate_limiter):
+    """A 429 on the probe goes through RateLimiter.handle_429 and is retried."""
+    mock_spotify_client.current_user_saved_tracks.side_effect = [
+        SpotifyException(http_status=429, code=-1, msg='rate limited',
+                         reason='QUOTA_EXCEEDED', headers={'Retry-After': '1'}),
+        create_mock_saved_tracks_response([], total=7),
+    ]
+    mock_spotify_client.current_user_playlists.return_value = create_mock_playlists_response([])
+
+    with patch.object(rate_limiter, 'handle_429') as handle_429:
+        result = spotify_fetcher.get_user_playlists(use_cache=False)
+
+    handle_429.assert_called_once_with(1)
+    assert [p['id'] for p in result] == [SpotifyFetcher.LIKED_SONGS_PLAYLIST_ID]
+    assert result[0]['tracks_count'] == 7
+
+
+def test_liked_songs_tracks_resolve_to_saved_tracks(spotify_fetcher, mock_spotify_client, rate_limiter, cache_manager):
+    """get_playlist_tracks(liked_songs) pages /me/tracks at 50/page, not a playlist endpoint."""
+    page1 = [create_mock_track(f'liked_{i}', f'Liked {i}', ['Artist'], 'Album', isrc=None) for i in range(50)]
+    page2 = [create_mock_track(f'liked_{i}', f'Liked {i}', ['Artist'], 'Album') for i in range(50, 75)]
+    mock_spotify_client.current_user_saved_tracks.side_effect = [
+        create_mock_saved_tracks_response(page1, total=75, has_next=True),
+        create_mock_saved_tracks_response(page2, total=75, has_next=False),
+    ]
+
+    tracks = spotify_fetcher.get_playlist_tracks(SpotifyFetcher.LIKED_SONGS_PLAYLIST_ID, use_cache=False)
+
+    assert len(tracks) == 75
+    assert tracks[0]['name'] == 'Liked 0'
+    assert tracks[74]['name'] == 'Liked 74'
+    assert tracks[0]['isrc'] is None  # ISRC is optional, never required
+
+    calls = mock_spotify_client.current_user_saved_tracks.call_args_list
+    assert calls[0].kwargs == {'limit': 50, 'offset': 0}
+    assert calls[1].kwargs == {'limit': 50, 'offset': 50}
+    assert not mock_spotify_client.playlist_items.called
+    assert not mock_spotify_client.playlist_tracks.called
+    assert rate_limiter.daily_operations == 2
+
+    # Cached under the synthetic id so the migrator's resume path can find them
+    cached = cache_manager.get_cached_tracks(SpotifyFetcher.LIKED_SONGS_PLAYLIST_ID)
+    assert len(cached) == 75
+
+
+def test_liked_songs_tracks_are_served_from_cache(spotify_fetcher, mock_spotify_client, cache_manager):
+    """Second fetch of Liked Songs uses the cache, like any playlist."""
+    cache_manager.cache_tracks(
+        [{'id': 'c1', 'name': 'Cached', 'artists': ['A'], 'album': 'B', 'duration_ms': 1000, 'isrc': None}],
+        SpotifyFetcher.LIKED_SONGS_PLAYLIST_ID,
+    )
+
+    tracks = spotify_fetcher.get_playlist_tracks(SpotifyFetcher.LIKED_SONGS_PLAYLIST_ID, use_cache=True)
+
+    assert [t['id'] for t in tracks] == ['c1']
+    assert not mock_spotify_client.current_user_saved_tracks.called
+
+
+# ============================================================================
+# Feb-2026 API rename: playlist `tracks` -> `items`
+# ============================================================================
+
+def test_playlist_track_count_from_legacy_tracks_field(spotify_fetcher):
+    """Pre-migration responses: tracks_count comes from playlist['tracks']['total']."""
+    meta = spotify_fetcher.extract_playlist_metadata(
+        {'id': 'p', 'name': 'Old Shape', 'tracks': {'total': 42, 'href': 'x'}, 'images': []}
+    )
+    assert meta['tracks_count'] == 42
+
+
+def test_playlist_track_count_from_renamed_items_field(spotify_fetcher):
+    """Post-migration responses: tracks_count comes from playlist['items']['total']."""
+    meta = spotify_fetcher.extract_playlist_metadata(
+        {'id': 'p', 'name': 'New Shape', 'items': {'total': 17, 'href': 'x'}, 'images': []}
+    )
+    assert meta['tracks_count'] == 17
+
+
+def test_playlist_track_count_from_items_list(spotify_fetcher):
+    """If `items` is an inline list rather than a paging object, count it."""
+    meta = spotify_fetcher.extract_playlist_metadata(
+        {'id': 'p', 'name': 'Inline', 'items': [{}, {}, {}], 'images': []}
+    )
+    assert meta['tracks_count'] == 3
+
+
+def test_playlist_track_count_missing_is_zero(spotify_fetcher):
+    """Neither field present -> 0, not an exception."""
+    meta = spotify_fetcher.extract_playlist_metadata({'id': 'p', 'name': 'Bare', 'images': []})
+    assert meta['tracks_count'] == 0
+
+
+def test_get_user_playlists_handles_mixed_tracks_and_items_naming(spotify_fetcher, mock_spotify_client):
+    """A page mixing both spellings yields correct counts for every playlist."""
+    old = {'id': 'old', 'name': 'Old', 'public': False, 'tracks': {'total': 5}, 'images': []}
+    new = {'id': 'new', 'name': 'New', 'public': False, 'items': {'total': 9}, 'images': []}
+    mock_spotify_client.current_user_playlists.return_value = create_mock_playlists_response([old, new])
+
+    result = spotify_fetcher.get_user_playlists(use_cache=False)
+
+    assert {p['id']: p['tracks_count'] for p in result} == {'old': 5, 'new': 9}
+
+
+def test_playlist_tracks_use_playlist_items_endpoint(spotify_fetcher, mock_spotify_client):
+    """Tracks are fetched via spotipy.playlist_items (the /items endpoint), 100/page."""
+    tracks = [create_mock_track('t1', 'Song', ['Artist'], 'Album')]
+    mock_spotify_client.playlist_items.return_value = create_mock_tracks_response(tracks)
+
+    result = spotify_fetcher.get_playlist_tracks('pl_1', use_cache=False)
+
+    assert [t['id'] for t in result] == ['t1']
+    mock_spotify_client.playlist_items.assert_called_once_with(
+        'pl_1', limit=100, offset=0, additional_types=('track',)
+    )
+    assert not mock_spotify_client.playlist_tracks.called
+
+
+def test_playlist_items_accept_item_key_for_track(spotify_fetcher, mock_spotify_client):
+    """A page item wrapping the track under 'item' instead of 'track' still parses."""
+    track = create_mock_track('t1', 'Song', ['Artist'], 'Album')
+    mock_spotify_client.playlist_items.return_value = {
+        'items': [{'item': track}, {'track': None}],
+        'next': None, 'total': 2,
+    }
+
+    result = spotify_fetcher.get_playlist_tracks('pl_1', use_cache=False)
+
+    assert [t['id'] for t in result] == ['t1']
+
+
+def test_quota_exceeded_429_is_routed_through_rate_limiter(spotify_fetcher, mock_spotify_client, rate_limiter):
+    """A dev-mode quota 429 (reason QUOTA_EXCEEDED) backs off via handle_429 and retries."""
+    tracks = [create_mock_track('t1', 'Song', ['Artist'], 'Album')]
+    mock_spotify_client.playlist_items.side_effect = [
+        SpotifyException(http_status=429, code=-1, msg='quota', reason='QUOTA_EXCEEDED',
+                         headers={'Retry-After': '30'}),
+        create_mock_tracks_response(tracks),
+    ]
+
+    with patch.object(rate_limiter, 'handle_429') as handle_429:
+        result = spotify_fetcher.get_playlist_tracks('pl_1', use_cache=False)
+
+    handle_429.assert_called_once_with(30)
+    assert len(result) == 1
+    assert mock_spotify_client.playlist_items.call_count == 2
 
 
 def test_extract_playlist_metadata(spotify_fetcher):
@@ -327,7 +575,7 @@ def test_get_playlist_tracks_pagination(spotify_fetcher, mock_spotify_client, ra
     ]
     
     # Mock API responses
-    mock_spotify_client.playlist_tracks.side_effect = [
+    mock_spotify_client.playlist_items.side_effect = [
         create_mock_tracks_response(page1_tracks, has_next=True),
         create_mock_tracks_response(page2_tracks, has_next=True),
         create_mock_tracks_response(page3_tracks, has_next=False)
@@ -342,7 +590,7 @@ def test_get_playlist_tracks_pagination(spotify_fetcher, mock_spotify_client, ra
     assert tracks[249]['name'] == 'Track 249'
     
     # Verify API was called 3 times
-    assert mock_spotify_client.playlist_tracks.call_count == 3
+    assert mock_spotify_client.playlist_items.call_count == 3
 
 
 def test_extract_track_metadata(spotify_fetcher):
@@ -502,7 +750,7 @@ def test_cache_hit_tracks(spotify_fetcher, mock_spotify_client, cache_manager):
     assert result[1]['name'] == 'Cached Track 2'
     
     # Verify API was NOT called
-    assert not mock_spotify_client.playlist_tracks.called
+    assert not mock_spotify_client.playlist_items.called
 
 
 def test_cache_miss_tracks(spotify_fetcher, mock_spotify_client, cache_manager):
@@ -516,7 +764,7 @@ def test_cache_miss_tracks(spotify_fetcher, mock_spotify_client, cache_manager):
     
     # Mock API response
     tracks = [create_mock_track('track1', 'New Track', ['Artist'], 'Album')]
-    mock_spotify_client.playlist_tracks.return_value = create_mock_tracks_response(tracks)
+    mock_spotify_client.playlist_items.return_value = create_mock_tracks_response(tracks)
     
     # Fetch tracks (cache is empty)
     result = spotify_fetcher.get_playlist_tracks(playlist_id, use_cache=True)
@@ -526,7 +774,7 @@ def test_cache_miss_tracks(spotify_fetcher, mock_spotify_client, cache_manager):
     assert result[0]['name'] == 'New Track'
     
     # Verify API was called
-    assert mock_spotify_client.playlist_tracks.called
+    assert mock_spotify_client.playlist_items.called
     
     # Verify data was cached
     cached = cache_manager.get_cached_tracks(playlist_id)
@@ -637,7 +885,7 @@ def test_refresh_playlist_tracks(spotify_fetcher, mock_spotify_client, cache_man
         create_mock_track('new1', 'New Track 1', ['New Artist'], 'New Album'),
         create_mock_track('new2', 'New Track 2', ['New Artist'], 'New Album')
     ]
-    mock_spotify_client.playlist_tracks.return_value = create_mock_tracks_response(fresh_tracks)
+    mock_spotify_client.playlist_items.return_value = create_mock_tracks_response(fresh_tracks)
     
     # Call refresh
     result = spotify_fetcher.refresh_playlist_tracks(playlist_id)
@@ -648,7 +896,7 @@ def test_refresh_playlist_tracks(spotify_fetcher, mock_spotify_client, cache_man
     assert result[1]['name'] == 'New Track 2'
     
     # Verify API was called
-    assert mock_spotify_client.playlist_tracks.called
+    assert mock_spotify_client.playlist_items.called
     
     # Verify cache was updated
     cached = cache_manager.get_cached_tracks(playlist_id)
@@ -668,7 +916,7 @@ def test_handle_deleted_playlist(spotify_fetcher, mock_spotify_client):
     from spotipy.exceptions import SpotifyException
     
     # Mock 404 error
-    mock_spotify_client.playlist_tracks.side_effect = SpotifyException(
+    mock_spotify_client.playlist_items.side_effect = SpotifyException(
         http_status=404,
         code=-1,
         msg='Not found'
