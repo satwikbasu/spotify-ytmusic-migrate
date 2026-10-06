@@ -35,9 +35,10 @@ class CacheManager:
             - image_url (TEXT): Cover image URL
             - last_fetched (TIMESTAMP): When playlist was last cached
             
-        tracks:
-            - spotify_id (TEXT PRIMARY KEY): Spotify track ID
+        tracks (primary key: spotify_id + playlist_id):
+            - spotify_id (TEXT): Spotify track ID
             - playlist_id (TEXT): Associated playlist ID
+            - position (INTEGER): Index of the track in its source playlist
             - name (TEXT): Track name
             - artists (TEXT): JSON-encoded list of artist names
             - album (TEXT): Album name
@@ -114,20 +115,26 @@ class CacheManager:
                     )
                 """)
                 
-                # Create tracks table
+                # Create tracks table. The key is (spotify_id, playlist_id) so a
+                # track that appears in several playlists is kept for each of
+                # them, and `position` preserves source order so a resumed job
+                # walks the playlist in the same order it was first fetched.
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS tracks (
-                        spotify_id TEXT PRIMARY KEY,
+                        spotify_id TEXT NOT NULL,
                         playlist_id TEXT NOT NULL,
                         name TEXT NOT NULL,
                         artists TEXT NOT NULL,
                         album TEXT,
                         duration_ms INTEGER,
                         isrc TEXT,
+                        position INTEGER DEFAULT 0,
+                        PRIMARY KEY (spotify_id, playlist_id),
                         FOREIGN KEY (playlist_id) REFERENCES playlists(id)
                     )
                 """)
-                
+                self._migrate_tracks_table(cursor)
+
                 # Create match_cache table
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS match_cache (
@@ -164,7 +171,49 @@ class CacheManager:
         except sqlite3.Error as e:
             logger.error(f"Failed to create tables: {str(e)}")
             raise
-    
+
+    @staticmethod
+    def _migrate_tracks_table(cursor: sqlite3.Cursor) -> None:
+        """Upgrade a pre-existing `tracks` table in place, keeping its rows.
+
+        Older databases keyed `tracks` on spotify_id alone (so a track in two
+        playlists overwrote itself) and had no `position` column. Detect that
+        shape and rebuild the table with the new key, copying every row. A
+        database already on the new shape is left untouched.
+        """
+        cursor.execute("PRAGMA table_info(tracks)")
+        info = cursor.fetchall()
+        columns = {row[1] for row in info}
+        pk_columns = {row[1] for row in info if row[5]}  # row[5] = pk ordinal
+
+        if 'position' in columns and pk_columns == {'spotify_id', 'playlist_id'}:
+            return
+
+        logger.info("Upgrading tracks table to composite key with position column")
+        cursor.execute("ALTER TABLE tracks RENAME TO tracks_legacy")
+        cursor.execute("""
+            CREATE TABLE tracks (
+                spotify_id TEXT NOT NULL,
+                playlist_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                artists TEXT NOT NULL,
+                album TEXT,
+                duration_ms INTEGER,
+                isrc TEXT,
+                position INTEGER DEFAULT 0,
+                PRIMARY KEY (spotify_id, playlist_id),
+                FOREIGN KEY (playlist_id) REFERENCES playlists(id)
+            )
+        """)
+        position_expr = "position" if 'position' in columns else "rowid"
+        cursor.execute(f"""
+            INSERT OR IGNORE INTO tracks
+                (spotify_id, playlist_id, name, artists, album, duration_ms, isrc, position)
+            SELECT spotify_id, playlist_id, name, artists, album, duration_ms, isrc, {position_expr}
+            FROM tracks_legacy
+        """)
+        cursor.execute("DROP TABLE tracks_legacy")
+
     def cache_playlist(self, playlist: Dict[str, Any]) -> None:
         """Cache playlist metadata.
         
@@ -239,16 +288,25 @@ class CacheManager:
             with self.connection:
                 cursor = self.connection.cursor()
                 
-                # Prepare track data for bulk insert
+                # Prepare track data for bulk insert. `position` records the
+                # track's place in the source playlist so get_cached_tracks()
+                # can hand it back in the same order (resume depends on this).
+                # If this playlist already has rows, new rows continue after them.
+                cursor.execute(
+                    "SELECT COALESCE(MAX(position), -1) FROM tracks WHERE playlist_id = ?",
+                    (playlist_id,)
+                )
+                next_position = cursor.fetchone()[0] + 1
+
                 track_data = []
                 for track in tracks:
                     if not track.get('id'):
                         logger.warning(f"Skipping track without ID: {track.get('name')}")
                         continue
-                    
+
                     # Convert artists list to JSON string
                     artists_json = json.dumps(track.get('artists', []))
-                    
+
                     track_data.append((
                         track.get('id'),
                         playlist_id,
@@ -256,14 +314,24 @@ class CacheManager:
                         artists_json,
                         track.get('album'),
                         track.get('duration_ms'),
-                        track.get('isrc')
+                        track.get('isrc'),
+                        next_position
                     ))
-                
-                # Bulk insert tracks
+                    next_position += 1
+
+                # Bulk insert tracks. A re-cache of a track already in this
+                # playlist keeps its original position (ON CONFLICT ... DO UPDATE
+                # does not touch `position`), so order is stable across re-fetches.
                 cursor.executemany("""
-                    INSERT OR REPLACE INTO tracks 
-                    (spotify_id, playlist_id, name, artists, album, duration_ms, isrc)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO tracks
+                    (spotify_id, playlist_id, name, artists, album, duration_ms, isrc, position)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(spotify_id, playlist_id) DO UPDATE SET
+                        name = excluded.name,
+                        artists = excluded.artists,
+                        album = excluded.album,
+                        duration_ms = excluded.duration_ms,
+                        isrc = excluded.isrc
                 """, track_data)
                 
                 logger.info(f"Cached {len(track_data)} tracks for playlist {playlist_id}")
@@ -348,6 +416,7 @@ class CacheManager:
                 SELECT spotify_id, playlist_id, name, artists, album, duration_ms, isrc
                 FROM tracks
                 WHERE playlist_id = ?
+                ORDER BY position ASC, rowid ASC
             """, (playlist_id,))
             
             rows = cursor.fetchall()

@@ -607,3 +607,49 @@ def test_thread_safety_error_log(manager):
     
     # Should have 150 errors (50 * 3 threads)
     assert len(manager._error_log) == 150
+
+
+# ============================================================================
+# Test: Resume wiring (contract §4.3)
+# ============================================================================
+
+def test_start_hands_migrator_to_resume(manager):
+    """start() must give the worker a migrator so interrupted jobs continue
+    instead of being marked failed."""
+    manager.start()
+    
+    kwargs = manager._mock_worker.resume_incomplete_migrations.call_args.kwargs
+    assert kwargs['migrator_func'] is manager.playlist_migrator.migrate_playlist
+    assert callable(kwargs['progress_callback'])
+
+
+def test_worker_gets_default_migrator_at_init(manager):
+    assert manager._mock_worker.default_migrator_func is manager.playlist_migrator.migrate_playlist
+
+
+def test_migrate_playlists_caches_prefetched_tracks_for_resume(manager, mock_cache_manager):
+    """Pre-fetched tracks are not cached by SpotifyFetcher, so the manager
+    stores them - a resume after restart reloads tracks from that table."""
+    tracks = [{'id': 't1', 'name': 'Track 1', 'artists': []}]
+    manager.migrate_playlists([{'id': 'sp_123', 'name': 'P', 'tracks': tracks}])
+    
+    mock_cache_manager.cache_tracks.assert_called_once_with(tracks, 'sp_123')
+
+
+def test_migrate_playlists_survives_cache_failure(manager, mock_cache_manager):
+    mock_cache_manager.cache_tracks.side_effect = Exception("disk full")
+    job_ids = manager.migrate_playlists([{'id': 'sp_123', 'name': 'P', 'tracks': [{'name': 'T'}]}])
+    assert job_ids == ['job-123']
+
+
+def test_resume_progress_wrapper_forwards_to_attached_callback(manager):
+    """A UI callback attached after start() still receives progress for resumed jobs."""
+    wrapper = manager._make_resume_progress_wrapper()
+    manager._mock_worker.get_current_job.return_value = {'playlist_name': 'Resumed'}
+    
+    wrapper(1, 2, 'Song')  # no callback attached yet: must not raise
+    
+    callback = Mock()
+    manager.set_progress_callback(callback)
+    wrapper(2, 2, 'Song', 1, 1)
+    callback.assert_called_once_with('Resumed', 2, 2, 'Song', 1, 1)

@@ -6,6 +6,7 @@ caching, and batch addition of tracks to YouTube Music playlists.
 
 import time
 import logging
+from collections import Counter
 from typing import List, Dict, Optional, Callable, Any, Generator
 
 from ytmusicapi import YTMusic
@@ -15,6 +16,7 @@ from src.searchers.youtube_searcher import YouTubeSearcher
 from src.matchers.track_matcher import TrackMatcher
 from src.utils.cache_manager import CacheManager
 from src.utils.rate_limiter import RateLimiter
+from config.app_config import YOUTUBE_PLAYLIST_MAX_ITEMS, INCREMENTAL_FLUSH_SIZE
 
 
 # Configure logging
@@ -23,13 +25,20 @@ logger = logging.getLogger(__name__)
 
 class PlaylistMigrator:
     """Orchestrates migration of Spotify playlists to YouTube Music.
-    
+
     Implements the complete migration pipeline:
-    1. Create YouTube Music playlist
+    1. Create (or reuse) the destination YouTube Music playlist(s)
     2. Search and match tracks (with caching)
-    3. Batch add matched tracks (100 at a time)
-    4. Generate migration report
-    
+    3. Flush matched tracks to YouTube as they accumulate (incremental writes)
+    4. Spill into a new destination playlist ("shard") every 5,000 items
+    5. Generate migration report
+
+    Resume support: every successful write is reported through
+    ``state_callback`` (destination playlist ids, total items added, and the
+    index of the last source track whose outcome is final). A caller can hand
+    that state back in as ``resume_state`` and the migrator continues from the
+    next unprocessed track without creating a second playlist.
+
     Attributes:
         ytmusic_client: Authenticated YTMusic API client
         youtube_searcher: YouTube Music search service
@@ -37,11 +46,15 @@ class PlaylistMigrator:
         cache_manager: SQLite cache for matched tracks
         rate_limiter: Rate limiting service
     """
-    
+
     # Batch configuration
     BATCH_SIZE = 100  # YouTube Music allows 100 tracks per request
     BATCH_DELAY = 0.5  # 500ms delay between batch additions
-    
+
+    # Incremental write / sharding configuration (see config/app_config.py)
+    FLUSH_SIZE = INCREMENTAL_FLUSH_SIZE
+    SHARD_SIZE = YOUTUBE_PLAYLIST_MAX_ITEMS
+
     # YouTube Music URL template
     PLAYLIST_URL_TEMPLATE = "https://music.youtube.com/playlist?list={}"
     
@@ -88,63 +101,66 @@ class PlaylistMigrator:
         self,
         playlist_name: str,
         tracks: List[Dict[str, Any]],
-        progress_callback: Optional[Callable[[int, int, str], None]] = None
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        resume_state: Optional[Dict[str, Any]] = None,
+        state_callback: Optional[Callable[..., None]] = None
     ) -> Dict[str, Any]:
         """Migrate a Spotify playlist to YouTube Music.
         
-        Complete migration pipeline:
-        1. Create YouTube Music playlist
-        2. For each Spotify track:
-           - Check cache for previous match
-           - If not cached, search YouTube Music
-           - Fuzzy match best result
-           - Cache successful match
-           - Collect video ID
+        Pipeline:
+        1. Reuse the destination playlist(s) from ``resume_state`` or create
+           the first one lazily when the first match needs writing
+        2. For each Spotify track past the resume point:
+           - Check cache for previous match, else search + fuzzy match
+           - Cache successful match, queue the video id for writing
            - Report progress
-        3. Batch add all matched video IDs (100 per batch)
-        4. Generate and return migration report
+           - Once FLUSH_SIZE matches are queued, write them to YouTube
+             (spilling into a new shard at SHARD_SIZE items) and report the
+             new durable state through ``state_callback``
+        3. Flush whatever is left, then build the report
         
         Args:
-            playlist_name: Name for the YouTube Music playlist
+            playlist_name: Name for the YouTube Music playlist. Playlists with
+                more than SHARD_SIZE source tracks are written to several
+                destination playlists named "<name> (1)", "<name> (2)", ...
             tracks: List of Spotify track dicts with keys:
                 - name: Track name (str)
                 - artists: Artist names (List[str])
                 - album: Album name (str)
                 - duration_ms: Duration in milliseconds (int)
-                - isrc: ISRC code (str, optional)
-                - spotify_id: Spotify track ID (str)
-            progress_callback: Optional callback function called after
-                each track is processed. Signature:
-                callback(current: int, total: int, track_name: str)
+                - id: Spotify track ID (str)
+            progress_callback: Optional callback called after each track is
+                processed: callback(current, total, track_name, matched, failed)
+                (a 3-argument callback is also accepted).
+            resume_state: Optional dict previously emitted via state_callback:
+                - youtube_playlist_ids (List[str]): shard ids already created
+                - added_tracks (int): items already written across all shards
+                - last_added_index (int): number of leading source tracks whose
+                  outcome is already final (they are skipped)
+                - matched_tracks / failed_tracks (int): prior counters
+            state_callback: Optional callback invoked with keyword arguments
+                (youtube_playlist_ids, added_tracks, last_added_index,
+                matched_tracks, failed_tracks) after every durable write.
         
         Returns:
             Migration report dict with keys:
             - playlist_name: str
-            - playlist_url: str (YouTube Music URL)
-            - total_tracks: int
-            - matched_tracks: int
-            - failed_tracks: List[dict] with {spotify_track, reason}
+            - playlist_url: str (URL of the first destination playlist)
+            - playlist_urls: List[str] (one per shard)
+            - playlist_ids: List[str] (one per shard)
+            - shard_count: int
+            - total_tracks: int (whole job, including resumed-over tracks)
+            - matched_tracks: int (whole job)
+            - failed_tracks: List[dict] with {spotify_track, reason} (this run)
+            - failed_count: int (whole job)
+            - resumed_from: int (0 when not a resume)
             - success_rate: float (percentage)
-            - match_scores: List[float] (confidence scores)
+            - match_scores: List[float] (confidence scores, this run)
             - duration_seconds: float (time taken)
         
         Raises:
             ValueError: If playlist_name is empty or tracks list is empty
-        
-        Example:
-            >>> migrator = PlaylistMigrator(ytmusic, searcher, matcher, cache, limiter)
-            >>> tracks = [
-            ...     {
-            ...         'name': 'Blinding Lights',
-            ...         'artists': ['The Weeknd'],
-            ...         'album': 'After Hours',
-            ...         'duration_ms': 200040,
-            ...         'spotify_id': 'abc123'
-            ...     }
-            ... ]
-            >>> report = migrator.migrate_playlist("My Playlist", tracks)
-            >>> report['success_rate']
-            100.0
+            RuntimeError: If the destination playlist cannot be created
         """
         # Validation
         if not playlist_name:
@@ -152,47 +168,125 @@ class PlaylistMigrator:
         if not tracks:
             raise ValueError("tracks list cannot be empty")
         
-        # Start timing
         start_time = time.time()
-        
-        logger.info(f"Starting migration for playlist: {playlist_name} ({len(tracks)} tracks)")
-        
-        # Initialize report data
         total_tracks = len(tracks)
-        matched_video_ids = []
-        match_scores = []
-        failed_tracks = []
         
-        # STEP 1: Create YouTube Music playlist
-        try:
-            playlist_id = self._create_youtube_playlist(playlist_name)
-            logger.info(f"Created YouTube Music playlist: {playlist_id}")
-        except Exception as e:
-            logger.error(f"Failed to create YouTube Music playlist: {e}", exc_info=True)
-            raise RuntimeError(f"Failed to create playlist: {e}") from e
+        # Durable state (seeded from a previous run when resuming)
+        resume_state = resume_state or {}
+        shard_ids: List[str] = list(resume_state.get('youtube_playlist_ids') or [])
+        added_total = int(resume_state.get('added_tracks') or 0)
+        start_index = int(resume_state.get('last_added_index') or 0)
+        prior_matched = int(resume_state.get('matched_tracks') or 0)
+        prior_failed = int(resume_state.get('failed_tracks') or 0)
         
-        # STEP 2: Process each track (search, match, cache)
-        for idx, spotify_track in enumerate(tracks, start=1):
+        if start_index < 0:
+            start_index = 0
+        if start_index > total_tracks:
+            start_index = total_tracks
+        
+        if start_index:
+            logger.info(
+                f"Resuming migration for playlist: {playlist_name} "
+                f"({start_index}/{total_tracks} tracks already final, "
+                f"{added_total} items already on YouTube in {len(shard_ids)} playlist(s))"
+            )
+        else:
+            logger.info(f"Starting migration for playlist: {playlist_name} ({total_tracks} tracks)")
+        
+        # Per-run report data
+        match_scores: List[float] = []
+        failed_tracks: List[Dict[str, Any]] = []
+        matched_count = 0
+        
+        # Matches waiting to be written: list of {'track', 'video_id', 'confidence'}
+        pending: List[Dict[str, Any]] = []
+        # Source index up to which every track's outcome is durable on YouTube
+        final_index = start_index
+        
+        def emit_state(last_index: int) -> None:
+            if not state_callback:
+                return
+            try:
+                state_callback(
+                    youtube_playlist_ids=list(shard_ids),
+                    added_tracks=added_total,
+                    last_added_index=last_index,
+                    matched_tracks=prior_matched + matched_count,
+                    failed_tracks=prior_failed + len(failed_tracks)
+                )
+            except Exception as e:
+                logger.error(f"State callback error: {e}", exc_info=True)
+        
+        def ensure_shard(shard_index: int) -> str:
+            """Return the destination playlist id for shard_index, creating
+            any missing shards (and recording them) on the way."""
+            nonlocal shard_ids
+            while len(shard_ids) <= shard_index:
+                name = self._shard_name(playlist_name, len(shard_ids), total_tracks)
+                try:
+                    new_id = self._create_youtube_playlist(name)
+                except Exception as e:
+                    logger.error(f"Failed to create YouTube Music playlist: {e}", exc_info=True)
+                    raise RuntimeError(f"Failed to create playlist: {e}") from e
+                shard_ids.append(new_id)
+                logger.info(f"Created YouTube Music playlist '{name}': {new_id}")
+                # Persist the id immediately so a crash between create and the
+                # first add does not produce a duplicate playlist on resume.
+                emit_state(final_index)
+            return shard_ids[shard_index]
+        
+        def flush(upto_index: int) -> None:
+            """Write every pending match to YouTube, spilling across shards,
+            then record that all source tracks up to upto_index are final."""
+            nonlocal added_total, matched_count, final_index
+            while pending:
+                shard_index = added_total // self.SHARD_SIZE
+                room = self.SHARD_SIZE - (added_total % self.SHARD_SIZE)
+                chunk = pending[:min(room, len(pending), self.BATCH_SIZE)]
+                del pending[:len(chunk)]
+                
+                shard_id = ensure_shard(shard_index)
+                video_ids = [item['video_id'] for item in chunk]
+                added_list = self.add_tracks_batch(shard_id, video_ids)
+                # Two source tracks may match the same video; count per occurrence
+                remaining = Counter(added_list)
+                
+                for item in chunk:
+                    if remaining[item['video_id']] > 0:
+                        remaining[item['video_id']] -= 1
+                        matched_count += 1
+                        match_scores.append(item['confidence'])
+                    else:
+                        failed_tracks.append({
+                            'spotify_track': item['track'],
+                            'reason': 'Failed to add to YouTube Music playlist'
+                        })
+                added_total += len(added_list)
+            
+            final_index = upto_index
+            emit_state(final_index)
+        
+        # Make sure the first destination playlist exists up front (matches the
+        # previous behaviour and surfaces auth problems before any searching).
+        if not shard_ids:
+            ensure_shard(0)
+        
+        # Process each track past the resume point
+        for idx in range(start_index + 1, total_tracks + 1):
+            spotify_track = tracks[idx - 1]
             track_name = spotify_track.get('name', 'Unknown Track')
             
             try:
-                # Debug track data
-                
-                # Process the track
                 video_id, confidence = self._process_track(spotify_track)
-                
-                # Debug logging
                 logger.debug(f"[{idx}/{total_tracks}] _process_track returned: video_id={video_id}, confidence={confidence}")
                 
                 if video_id:
-                    matched_video_ids.append(video_id)
-                    match_scores.append(confidence)
+                    pending.append({'track': spotify_track, 'video_id': video_id, 'confidence': confidence})
                     logger.info(
                         f"[{idx}/{total_tracks}] Matched: {track_name} "
                         f"(confidence: {confidence:.1f}%)"
                     )
                 else:
-                    # No match found
                     failed_tracks.append({
                         'spotify_track': spotify_track,
                         'reason': 'No match found above threshold'
@@ -200,7 +294,6 @@ class PlaylistMigrator:
                     logger.warning(f"[{idx}/{total_tracks}] No match: {track_name}")
             
             except Exception as e:
-                # Track processing failed
                 failed_tracks.append({
                     'spotify_track': spotify_track,
                     'reason': f'Error: {str(e)}'
@@ -210,12 +303,11 @@ class PlaylistMigrator:
                     exc_info=True
                 )
             
-            # Report progress with current match/fail counts
+            # Report progress with whole-job match/fail counts
             if progress_callback:
                 try:
-                    # Pass current matched and failed counts
-                    matched_so_far = len(matched_video_ids)
-                    failed_so_far = len(failed_tracks)
+                    matched_so_far = prior_matched + matched_count + len(pending)
+                    failed_so_far = prior_failed + len(failed_tracks)
                     progress_callback(idx, total_tracks, track_name, matched_so_far, failed_so_far)
                 except TypeError:
                     # Fallback for old callback signature (3 params)
@@ -225,40 +317,56 @@ class PlaylistMigrator:
                         logger.error(f"Progress callback error: {e}", exc_info=True)
                 except Exception as e:
                     logger.error(f"Progress callback error: {e}", exc_info=True)
+            
+            # Incremental write: flush as soon as enough matches have accumulated
+            if len(pending) >= self.FLUSH_SIZE:
+                logger.info(f"Flushing {len(pending)} matched tracks to YouTube Music...")
+                flush(idx)
         
-        # STEP 3: Batch add matched tracks to playlist
-        if matched_video_ids:
-            logger.info(f"Adding {len(matched_video_ids)} tracks to playlist in batches...")
-            try:
-                self.add_tracks_batch(playlist_id, matched_video_ids)
-                logger.info("Successfully added all matched tracks")
-            except Exception as e:
-                logger.error(f"Error adding tracks to playlist: {e}", exc_info=True)
-                # Don't raise - we still want to return the report
+        # Final flush of whatever is left
+        if pending:
+            logger.info(f"Adding final {len(pending)} matched tracks to YouTube Music...")
+        flush(total_tracks)
         
-        # Calculate migration statistics
-        matched_count = len(matched_video_ids)
-        success_rate = (matched_count / total_tracks * 100) if total_tracks > 0 else 0
+        # Statistics for the whole job (prior runs + this run)
+        job_matched = prior_matched + matched_count
+        job_failed = prior_failed + len(failed_tracks)
+        success_rate = (job_matched / total_tracks * 100) if total_tracks > 0 else 0
         duration = time.time() - start_time
         
-        # STEP 4: Generate migration report
         report = {
             'playlist_name': playlist_name,
-            'playlist_url': self.PLAYLIST_URL_TEMPLATE.format(playlist_id),
+            'playlist_url': self.PLAYLIST_URL_TEMPLATE.format(shard_ids[0]) if shard_ids else '',
+            'playlist_urls': [self.PLAYLIST_URL_TEMPLATE.format(pid) for pid in shard_ids],
+            'playlist_ids': list(shard_ids),
+            'shard_count': len(shard_ids),
             'total_tracks': total_tracks,
-            'matched_tracks': matched_count,
+            'matched_tracks': job_matched,
             'failed_tracks': failed_tracks,
+            'failed_count': job_failed,
+            'resumed_from': start_index,
             'success_rate': success_rate,
             'match_scores': match_scores,
             'duration_seconds': duration
         }
         
         logger.info(
-            f"Migration complete: {matched_count}/{total_tracks} tracks "
-            f"({success_rate:.1f}%) in {duration:.1f}s"
+            f"Migration complete: {job_matched}/{total_tracks} tracks "
+            f"({success_rate:.1f}%) across {len(shard_ids)} playlist(s) in {duration:.1f}s"
         )
         
         return report
+    
+    def _shard_name(self, playlist_name: str, shard_index: int, total_tracks: int) -> str:
+        """Name for destination shard ``shard_index`` (0-based).
+        
+        A playlist that fits in one YouTube playlist keeps its own name. One
+        that cannot gets numbered shards from the start, so the names are
+        stable across a resume regardless of how many matches succeed.
+        """
+        if total_tracks <= self.SHARD_SIZE and shard_index == 0:
+            return playlist_name
+        return f"{playlist_name} ({shard_index + 1})"
     
     def _create_youtube_playlist(self, playlist_name: str) -> str:
         """Create a new YouTube Music playlist.
@@ -373,7 +481,7 @@ class PlaylistMigrator:
         self,
         playlist_id: str,
         video_ids: List[str]
-    ) -> None:
+    ) -> List[str]:
         """Add tracks to YouTube Music playlist in batches.
         
         Implements batching to avoid request size limits and rate limiting:
@@ -385,6 +493,10 @@ class PlaylistMigrator:
         Args:
             playlist_id: YouTube Music playlist ID
             video_ids: List of YouTube video IDs to add
+        
+        Returns:
+            The video IDs that were actually written (a batch that exhausted
+            its retries is left out), so callers can record durable progress.
         
         Raises:
             ValueError: If playlist_id is empty or video_ids is empty
@@ -398,6 +510,7 @@ class PlaylistMigrator:
         
         # Split into batches
         batches = list(self.chunks(video_ids, self.BATCH_SIZE))
+        added: List[str] = []
         
         for batch_idx, batch in enumerate(batches, start=1):
             batch_size = len(batch)
@@ -418,6 +531,7 @@ class PlaylistMigrator:
                     
                     # Record successful request
                     self.rate_limiter.record_request()
+                    added.extend(batch)
                     
                     logger.info(f"Batch {batch_idx} added successfully")
                     
@@ -466,6 +580,8 @@ class PlaylistMigrator:
                     else:
                         logger.error(f"Skipping batch {batch_idx} after unexpected errors")
                         break
+        
+        return added
     
     @staticmethod
     def chunks(lst: List[Any], n: int) -> Generator[List[Any], None, None]:

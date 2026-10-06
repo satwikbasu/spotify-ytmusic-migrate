@@ -607,3 +607,269 @@ def test_migration_does_not_issue_isrc_searches(migrator, mock_ytmusic, mock_sea
     migrator.migrate_playlist("No ISRC Please", sample_tracks)
 
     mock_searcher.search_by_isrc.assert_not_called()
+
+
+# ============================================================================
+# Incremental writes, sharding, resume (contract §4.3)
+# ============================================================================
+
+from config.app_config import YOUTUBE_PLAYLIST_MAX_ITEMS, INCREMENTAL_FLUSH_SIZE
+
+
+def _make_tracks(n, prefix='t'):
+    return [
+        {'name': f'Song {i}', 'artists': [f'Artist {i}'], 'album': 'A',
+         'duration_ms': 200000, 'id': f'{prefix}{i}'}
+        for i in range(1, n + 1)
+    ]
+
+
+def test_constants_come_from_app_config(migrator):
+    """The 5,000 cap and flush size are named constants, not magic numbers."""
+    assert PlaylistMigrator.SHARD_SIZE == YOUTUBE_PLAYLIST_MAX_ITEMS == 5000
+    assert PlaylistMigrator.FLUSH_SIZE == INCREMENTAL_FLUSH_SIZE
+    assert 50 <= PlaylistMigrator.FLUSH_SIZE <= 100
+
+
+@patch('src.migrators.playlist_migrator.time.sleep')
+def test_incremental_flush_writes_before_search_completes(mock_sleep, migrator, mock_ytmusic,
+                                                          mock_searcher, mock_matcher):
+    """Matched tracks are written to YouTube while the search loop is still
+    running - not after every track has been searched."""
+    events = []
+    
+    def search(name, artists):
+        events.append(('search', name))
+        return [{'videoId': 'v_' + name, 'title': name, 'artists': []}]
+    
+    def add(playlistId, videoIds):
+        events.append(('add', len(videoIds)))
+    
+    mock_searcher.search_track.side_effect = search
+    mock_matcher.match_track.side_effect = lambda t, r: (r[0]['videoId'], 90.0)
+    mock_ytmusic.add_playlist_items.side_effect = add
+    
+    n = PlaylistMigrator.FLUSH_SIZE * 2 + 7
+    report = migrator.migrate_playlist("Big", _make_tracks(n))
+    
+    adds = [i for i, e in enumerate(events) if e[0] == 'add']
+    searches = [i for i, e in enumerate(events) if e[0] == 'search']
+    # Three writes: two full flushes mid-loop plus the remainder at the end
+    assert [events[i][1] for i in adds] == [PlaylistMigrator.FLUSH_SIZE, PlaylistMigrator.FLUSH_SIZE, 7]
+    # The first write happens before the last search
+    assert adds[0] < searches[-1]
+    # Exactly FLUSH_SIZE searches precede the first write
+    assert sum(1 for i in searches if i < adds[0]) == PlaylistMigrator.FLUSH_SIZE
+    assert report['matched_tracks'] == n
+    assert report['shard_count'] == 1
+
+
+@patch('src.migrators.playlist_migrator.time.sleep')
+def test_state_callback_reports_durable_progress_after_each_flush(mock_sleep, migrator, mock_ytmusic,
+                                                                 mock_searcher, mock_matcher):
+    """After every write the caller learns the playlist id(s), how many items
+    are on YouTube, and the index of the last source track that is final."""
+    mock_ytmusic.create_playlist.return_value = 'PL_X'
+    mock_searcher.search_track.return_value = [{'videoId': 'v', 'title': 'T', 'artists': []}]
+    mock_matcher.match_track.return_value = ('v', 90.0)
+    states = []
+    
+    n = PlaylistMigrator.FLUSH_SIZE + 3
+    migrator.migrate_playlist("P", _make_tracks(n), state_callback=lambda **s: states.append(s))
+    
+    # First state: playlist created, nothing added yet (guards against duplicate
+    # playlists if we crash right after create).
+    assert states[0] == {'youtube_playlist_ids': ['PL_X'], 'added_tracks': 0,
+                         'last_added_index': 0, 'matched_tracks': 0, 'failed_tracks': 0}
+    # After the first flush
+    assert states[1]['added_tracks'] == PlaylistMigrator.FLUSH_SIZE
+    assert states[1]['last_added_index'] == PlaylistMigrator.FLUSH_SIZE
+    # Final flush
+    assert states[-1]['added_tracks'] == n
+    assert states[-1]['last_added_index'] == n
+    assert states[-1]['matched_tracks'] == n
+
+
+@patch('src.migrators.playlist_migrator.time.sleep')
+def test_unmatched_tracks_still_advance_last_added_index(mock_sleep, migrator, mock_ytmusic,
+                                                         mock_searcher, mock_matcher):
+    """A track with no match is final too; resume must not re-search it."""
+    mock_searcher.search_track.return_value = []
+    states = []
+    
+    report = migrator.migrate_playlist("P", _make_tracks(3), state_callback=lambda **s: states.append(s))
+    
+    assert report['matched_tracks'] == 0
+    assert states[-1]['last_added_index'] == 3
+    assert states[-1]['failed_tracks'] == 3
+    assert states[-1]['added_tracks'] == 0
+    mock_ytmusic.add_playlist_items.assert_not_called()
+
+
+@patch('src.migrators.playlist_migrator.time.sleep')
+def test_resume_skips_added_tracks_and_reuses_playlist(mock_sleep, migrator, mock_ytmusic,
+                                                      mock_searcher, mock_matcher):
+    """Given the state of an interrupted run, the migrator continues from the
+    next track, writes into the existing playlist, and creates nothing new."""
+    mock_searcher.search_track.side_effect = lambda name, a: [{'videoId': 'v_' + name, 'title': name, 'artists': []}]
+    mock_matcher.match_track.side_effect = lambda t, r: (r[0]['videoId'], 90.0)
+    tracks = _make_tracks(5)
+    
+    report = migrator.migrate_playlist(
+        "P", tracks,
+        resume_state={'youtube_playlist_ids': ['PL_EXISTING'], 'added_tracks': 3,
+                      'last_added_index': 3, 'matched_tracks': 3, 'failed_tracks': 0}
+    )
+    
+    mock_ytmusic.create_playlist.assert_not_called()
+    searched = [c.args[0] for c in mock_searcher.search_track.call_args_list]
+    assert searched == ['Song 4', 'Song 5']
+    mock_ytmusic.add_playlist_items.assert_called_once_with(
+        playlistId='PL_EXISTING', videoIds=['v_Song 4', 'v_Song 5'])
+    assert report['resumed_from'] == 3
+    assert report['matched_tracks'] == 5          # whole job
+    assert report['total_tracks'] == 5
+    assert report['success_rate'] == 100.0
+    assert 'PL_EXISTING' in report['playlist_url']
+
+
+@patch('src.migrators.playlist_migrator.time.sleep')
+def test_resume_with_everything_already_added_does_nothing(mock_sleep, migrator, mock_ytmusic, mock_searcher):
+    report = migrator.migrate_playlist(
+        "P", _make_tracks(2),
+        resume_state={'youtube_playlist_ids': ['PL_DONE'], 'added_tracks': 2,
+                      'last_added_index': 2, 'matched_tracks': 2}
+    )
+    mock_searcher.search_track.assert_not_called()
+    mock_ytmusic.create_playlist.assert_not_called()
+    mock_ytmusic.add_playlist_items.assert_not_called()
+    assert report['matched_tracks'] == 2
+
+
+@patch('src.migrators.playlist_migrator.time.sleep')
+def test_crash_then_resume_round_trip(mock_sleep, migrator, mock_ytmusic, mock_searcher, mock_matcher):
+    """End to end: a run dies mid-search after one flush; feeding the last
+    reported state into a second run finishes the job with one playlist and
+    every matched track written exactly once."""
+    class Crash(BaseException):
+        """Simulates the process dying (not caught by per-track handlers)."""
+    
+    mock_ytmusic.create_playlist.return_value = 'PL_ONE'
+    mock_matcher.match_track.side_effect = lambda t, r: (r[0]['videoId'], 90.0)
+    tracks = _make_tracks(PlaylistMigrator.FLUSH_SIZE + 20)
+    crash_at = PlaylistMigrator.FLUSH_SIZE + 10
+    calls = {'n': 0}
+    
+    def search(name, artists):
+        calls['n'] += 1
+        if calls['n'] == crash_at:
+            raise Crash()
+        return [{'videoId': 'v_' + name, 'title': name, 'artists': []}]
+    mock_searcher.search_track.side_effect = search
+    
+    states = []
+    with pytest.raises(Crash):
+        migrator.migrate_playlist("P", tracks, state_callback=lambda **s: states.append(s))
+    
+    # One flush made it to YouTube before the crash
+    assert mock_ytmusic.add_playlist_items.call_count == 1
+    last_state = states[-1]
+    assert last_state['added_tracks'] == PlaylistMigrator.FLUSH_SIZE
+    assert last_state['last_added_index'] == PlaylistMigrator.FLUSH_SIZE
+    
+    # Restart with the persisted state
+    report = migrator.migrate_playlist("P", tracks, resume_state=last_state)
+    
+    assert mock_ytmusic.create_playlist.call_count == 1       # no duplicate playlist
+    written = [vid for c in mock_ytmusic.add_playlist_items.call_args_list for vid in c.kwargs['videoIds']]
+    assert len(written) == len(tracks)
+    assert len(set(written)) == len(tracks)                   # nothing written twice
+    assert report['matched_tracks'] == len(tracks)
+    assert report['playlist_ids'] == ['PL_ONE']
+
+
+@patch('src.migrators.playlist_migrator.time.sleep')
+def test_shards_at_youtube_playlist_cap(mock_sleep, migrator, mock_ytmusic, mock_cache):
+    """A source playlist with more than 5,000 matched tracks is written to
+    several destination playlists, none holding more than 5,000 items."""
+    n = YOUTUBE_PLAYLIST_MAX_ITEMS + 1
+    # Cache hits keep the test fast and deterministic (no search)
+    mock_cache.get_cached_match.side_effect = lambda sid: {'youtube_video_id': 'v_' + sid, 'confidence': 0.9}
+    mock_ytmusic.create_playlist.side_effect = ['PL_1', 'PL_2']
+    states = []
+    
+    report = migrator.migrate_playlist("Huge", _make_tracks(n), state_callback=lambda **s: states.append(s))
+    
+    # Two shards, numbered from the start so names are stable across a resume
+    assert mock_ytmusic.create_playlist.call_args_list[0].kwargs['title'] == 'Huge (1)'
+    assert mock_ytmusic.create_playlist.call_args_list[1].kwargs['title'] == 'Huge (2)'
+    
+    per_playlist = {}
+    for c in mock_ytmusic.add_playlist_items.call_args_list:
+        per_playlist[c.kwargs['playlistId']] = per_playlist.get(c.kwargs['playlistId'], 0) + len(c.kwargs['videoIds'])
+    assert per_playlist == {'PL_1': YOUTUBE_PLAYLIST_MAX_ITEMS, 'PL_2': 1}
+    
+    assert report['shard_count'] == 2
+    assert report['playlist_ids'] == ['PL_1', 'PL_2']
+    assert len(report['playlist_urls']) == 2
+    assert report['matched_tracks'] == n
+    # Both shard ids are on the durable state for resume
+    assert states[-1]['youtube_playlist_ids'] == ['PL_1', 'PL_2']
+    assert states[-1]['added_tracks'] == n
+
+
+@patch('src.migrators.playlist_migrator.time.sleep')
+def test_small_playlist_keeps_its_own_name(mock_sleep, migrator, mock_ytmusic, mock_searcher, mock_matcher):
+    mock_searcher.search_track.return_value = [{'videoId': 'v', 'title': 'T', 'artists': []}]
+    mock_matcher.match_track.return_value = ('v', 90.0)
+    migrator.migrate_playlist("Just Mine", _make_tracks(2))
+    assert mock_ytmusic.create_playlist.call_args.kwargs['title'] == 'Just Mine'
+
+
+@patch('src.migrators.playlist_migrator.time.sleep')
+def test_resume_continues_into_second_shard(mock_sleep, migrator, mock_ytmusic, mock_cache):
+    """Resuming a sharded job whose first shard is full creates only the
+    missing shard and writes the remaining tracks there."""
+    n = YOUTUBE_PLAYLIST_MAX_ITEMS + 2
+    mock_cache.get_cached_match.side_effect = lambda sid: {'youtube_video_id': 'v_' + sid, 'confidence': 0.9}
+    mock_ytmusic.create_playlist.return_value = 'PL_2'
+    
+    report = migrator.migrate_playlist(
+        "Huge", _make_tracks(n),
+        resume_state={'youtube_playlist_ids': ['PL_1'], 'added_tracks': YOUTUBE_PLAYLIST_MAX_ITEMS,
+                      'last_added_index': YOUTUBE_PLAYLIST_MAX_ITEMS,
+                      'matched_tracks': YOUTUBE_PLAYLIST_MAX_ITEMS}
+    )
+    
+    mock_ytmusic.create_playlist.assert_called_once_with(
+        title='Huge (2)', description="Migrated from Spotify by spotify-yt-migrate")
+    mock_ytmusic.add_playlist_items.assert_called_once_with(
+        playlistId='PL_2', videoIds=[f'v_t{n-1}', f'v_t{n}'])
+    assert report['playlist_ids'] == ['PL_1', 'PL_2']
+    assert report['matched_tracks'] == n
+
+
+@patch('src.migrators.playlist_migrator.time.sleep')
+def test_add_tracks_batch_returns_only_written_ids(mock_sleep, migrator, mock_ytmusic):
+    """Callers need to know what actually landed to record durable progress."""
+    video_ids = [f'v{i}' for i in range(150)]
+    mock_ytmusic.add_playlist_items.side_effect = [
+        ValueError("boom"), ValueError("boom"), ValueError("boom"),  # first batch exhausts retries
+        None,                                                        # second batch succeeds
+    ]
+    added = migrator.add_tracks_batch('PL123', video_ids)
+    assert added == video_ids[100:]
+
+
+@patch('src.migrators.playlist_migrator.time.sleep')
+def test_failed_write_is_reported_not_counted_as_matched(mock_sleep, migrator, mock_ytmusic,
+                                                         mock_searcher, mock_matcher):
+    mock_searcher.search_track.return_value = [{'videoId': 'v', 'title': 'T', 'artists': []}]
+    mock_matcher.match_track.return_value = ('v', 90.0)
+    mock_ytmusic.add_playlist_items.side_effect = ValueError("boom")
+    
+    report = migrator.migrate_playlist("P", _make_tracks(2))
+    
+    assert report['matched_tracks'] == 0
+    assert len(report['failed_tracks']) == 2
+    assert all('add to YouTube' in f['reason'] for f in report['failed_tracks'])

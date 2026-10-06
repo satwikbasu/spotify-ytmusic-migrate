@@ -728,39 +728,256 @@ def test_resume_incomplete_migrations_none(worker):
     assert resumed == []
 
 
-def test_resume_incomplete_migrations(worker, cache_manager, sample_tracks):
-    """Test resuming incomplete migrations after crash."""
-    # Manually insert incomplete migration into database
+def _insert_interrupted_job(cache_manager, job_id, playlist_id="sp_interrupted",
+                            total=5, status="in_progress", **resume_cols):
+    """Insert a migrations row as a previous (crashed) run would have left it."""
+    import json as _json
+    cols = {
+        'job_id': job_id,
+        'playlist_name': "Interrupted Playlist",
+        'playlist_id': playlist_id,
+        'status': status,
+        'total_tracks': total,
+        'processed_tracks': resume_cols.get('last_added_index', 0),
+        'created_at': datetime.now(),
+        'started_at': datetime.now(),
+    }
+    for key, value in resume_cols.items():
+        if key == 'youtube_playlist_ids':
+            value = _json.dumps(value)
+        cols[key] = value
     cursor = cache_manager.connection.cursor()
-    job_id = "test-job-123"
-    
-    cursor.execute("""
-        INSERT INTO migrations 
-        (job_id, playlist_name, playlist_id, status, total_tracks, 
-         processed_tracks, created_at, started_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        job_id,
-        "Interrupted Playlist",
-        "sp_interrupted",
-        "in_progress",
-        5,
-        3,
-        datetime.now(),
-        datetime.now()
-    ))
+    cursor.execute(
+        f"INSERT INTO migrations ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})",
+        list(cols.values())
+    )
     cache_manager.connection.commit()
-    
-    # Resume incomplete migrations
+
+
+def test_resume_incomplete_migrations_without_migrator_marks_failed(worker, cache_manager):
+    """With nothing to run the job with, an interrupted job is failed (not left dangling)."""
+    job_id = "test-job-123"
+    _insert_interrupted_job(cache_manager, job_id)
+
     resumed = worker.resume_incomplete_migrations()
-    
-    assert len(resumed) == 1
-    assert resumed[0] == job_id
-    
-    # Verify job is marked as failed
+
+    assert resumed == [job_id]
     status = worker.get_job_status(job_id)
     assert status['status'] == 'failed'
     assert 'interrupted' in status['error_message'].lower()
+
+
+def test_resume_incomplete_migrations_requeues_and_continues(worker, cache_manager, sample_tracks):
+    """Contract §4.3: resume must actually resume, not mark the job failed.
+
+    The job row carries the destination playlist id and the index of the last
+    track written to YouTube; the source tracks come back from the tracks
+    table. The job is re-queued with that state and the migrator receives it.
+    """
+    job_id = "resume-me"
+    cache_manager.cache_tracks(sample_tracks, "sp_resume")
+    _insert_interrupted_job(
+        cache_manager, job_id, playlist_id="sp_resume", total=2,
+        youtube_playlist_ids=['PL_EXISTING'], added_tracks=1, last_added_index=1,
+        matched_tracks=1, failed_tracks=0
+    )
+
+    received = {}
+
+    def migrator_func(playlist_name, tracks, progress_callback, resume_state=None, state_callback=None):
+        received['tracks'] = tracks
+        received['resume_state'] = resume_state
+        received['state_callback'] = state_callback
+        return {'matched_tracks': 2, 'total_tracks': 2, 'playlist_url': ''}
+
+    resumed = worker.resume_incomplete_migrations(migrator_func=migrator_func)
+    assert resumed == [job_id]
+
+    # Re-queued, not failed
+    status = worker.get_job_status(job_id)
+    assert status['status'] == 'queued'
+    assert status['error_message'] is None
+
+    worker.start()
+    deadline = time.time() + 5
+    while time.time() < deadline and worker.get_job_status(job_id)['status'] != 'completed':
+        time.sleep(0.05)
+    worker.stop()
+
+    assert worker.get_job_status(job_id)['status'] == 'completed'
+    # Source tracks reloaded from the tracks table, in order
+    assert [t['id'] for t in received['tracks']] == ['track1', 'track2']
+    # Durable state handed to the migrator so it skips what is already on YouTube
+    assert received['resume_state']['youtube_playlist_ids'] == ['PL_EXISTING']
+    assert received['resume_state']['last_added_index'] == 1
+    assert received['resume_state']['added_tracks'] == 1
+    assert callable(received['state_callback'])
+
+
+def test_resume_uses_default_migrator(worker, cache_manager, sample_tracks):
+    """The owner (MigrationManager) can install the migrator once on the worker."""
+    cache_manager.cache_tracks(sample_tracks, "sp_default")
+    _insert_interrupted_job(cache_manager, "job-default", playlist_id="sp_default", total=2)
+    worker.default_migrator_func = Mock(return_value={'matched_tracks': 2, 'total_tracks': 2})
+
+    worker.resume_incomplete_migrations()
+
+    assert worker.get_job_status("job-default")['status'] == 'queued'
+    assert worker.job_queue.qsize() == 1
+
+
+def test_resume_picks_up_queued_jobs_too(worker, cache_manager, sample_tracks):
+    """Jobs that were queued but never started are lost with the in-memory queue
+    on a crash; they must be re-queued as well."""
+    cache_manager.cache_tracks(sample_tracks, "sp_q")
+    _insert_interrupted_job(cache_manager, "job-q", playlist_id="sp_q", total=2, status="queued")
+
+    resumed = worker.resume_incomplete_migrations(migrator_func=Mock(return_value={}))
+
+    assert resumed == ["job-q"]
+    assert worker.job_queue.qsize() == 1
+
+
+def test_resume_without_cached_tracks_fails_with_explanation(worker, cache_manager):
+    """A job whose source tracks were never cached cannot continue; say why."""
+    _insert_interrupted_job(cache_manager, "job-nocache", playlist_id="sp_missing")
+
+    worker.resume_incomplete_migrations(migrator_func=Mock(return_value={}))
+
+    status = worker.get_job_status("job-nocache")
+    assert status['status'] == 'failed'
+    assert 'no longer cached' in status['error_message']
+    assert worker.job_queue.qsize() == 0
+
+
+def test_resume_does_not_touch_finished_jobs(worker, cache_manager, sample_tracks):
+    """Completed and failed jobs are left alone."""
+    cache_manager.cache_tracks(sample_tracks, "sp_done")
+    _insert_interrupted_job(cache_manager, "job-done", playlist_id="sp_done", status="completed")
+    _insert_interrupted_job(cache_manager, "job-fail", playlist_id="sp_done", status="failed")
+
+    assert worker.resume_incomplete_migrations(migrator_func=Mock()) == []
+
+
+# ============================================================================
+# Test: Durable resume state on the job row
+# ============================================================================
+
+def test_migrations_table_has_resume_columns(cache_manager):
+    """The job row persists playlist ids and the last-added position."""
+    BackgroundWorker(cache_manager)
+    cursor = cache_manager.connection.cursor()
+    cursor.execute("PRAGMA table_info(migrations)")
+    columns = {row[1] for row in cursor.fetchall()}
+
+    for column in ('youtube_playlist_ids', 'added_tracks', 'last_added_index',
+                   'matched_tracks', 'failed_tracks'):
+        assert column in columns
+
+
+def test_migrations_table_upgrades_old_schema_in_place(tmp_path):
+    """An existing database from before resume support gains the new columns
+    without losing its rows."""
+    db_path = tmp_path / "old.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("""
+        CREATE TABLE migrations (
+            job_id TEXT PRIMARY KEY,
+            playlist_name TEXT NOT NULL,
+            playlist_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            total_tracks INTEGER NOT NULL,
+            processed_tracks INTEGER DEFAULT 0,
+            last_track_id TEXT,
+            created_at TIMESTAMP NOT NULL,
+            started_at TIMESTAMP,
+            completed_at TIMESTAMP,
+            error_message TEXT
+        )
+    """)
+    conn.execute("""
+        INSERT INTO migrations (job_id, playlist_name, playlist_id, status, total_tracks, created_at)
+        VALUES ('legacy', 'Legacy', 'sp_legacy', 'completed', 7, ?)
+    """, (datetime.now(),))
+    conn.commit()
+    conn.close()
+
+    cache_manager = CacheManager(str(db_path))
+    worker = BackgroundWorker(cache_manager)
+
+    status = worker.get_job_status('legacy')
+    assert status['status'] == 'completed'
+    assert status['total'] == 7
+    assert status['youtube_playlist_ids'] == []
+    assert status['last_added_index'] == 0
+
+    # Idempotent: constructing again must not fail on existing columns
+    BackgroundWorker(cache_manager)
+
+
+def test_update_job_progress_records_last_added_position(worker, sample_tracks):
+    """_update_job_progress persists the playlist ids and last-added index."""
+    job_id = worker.add_job("P", "sp", sample_tracks, Mock())
+
+    worker._update_job_progress(
+        job_id, 1, 2,
+        youtube_playlist_ids=['PL_A', 'PL_B'], added_tracks=5001,
+        last_added_index=1, matched_tracks=1, failed_tracks=0
+    )
+
+    status = worker.get_job_status(job_id)
+    assert status['progress'] == 1
+    assert status['youtube_playlist_ids'] == ['PL_A', 'PL_B']
+    assert status['added_tracks'] == 5001
+    assert status['last_added_index'] == 1
+
+
+def test_state_callback_persists_resume_state_during_job(worker, sample_tracks):
+    """A migrator reporting durable state through state_callback has it written
+    to the job row while the job is still running (so a crash can resume)."""
+    seen_mid_job = {}
+
+    def migrator_func(playlist_name, tracks, progress_callback, resume_state=None, state_callback=None):
+        assert resume_state is None  # fresh job
+        state_callback(youtube_playlist_ids=['PL_NEW'], added_tracks=1,
+                       last_added_index=1, matched_tracks=1, failed_tracks=0)
+        # Read back from a separate connection, as a restarted app would
+        conn = sqlite3.connect(worker.db_path)
+        row = conn.execute(
+            "SELECT youtube_playlist_ids, last_added_index FROM migrations WHERE job_id = ?",
+            (job_id,)
+        ).fetchone()
+        conn.close()
+        seen_mid_job['row'] = row
+        return {'matched_tracks': 2, 'total_tracks': 2}
+
+    job_id = worker.add_job("P", "sp", sample_tracks, migrator_func)
+    worker.start()
+    deadline = time.time() + 5
+    while time.time() < deadline and worker.get_job_status(job_id)['status'] != 'completed':
+        time.sleep(0.05)
+    worker.stop()
+
+    assert seen_mid_job['row'] == ('["PL_NEW"]', 1)
+
+
+def test_legacy_three_arg_migrator_still_supported(worker, sample_tracks):
+    """Migrators that do not know about resume_state keep working unchanged."""
+    calls = []
+
+    def legacy(playlist_name, tracks, progress_callback):
+        calls.append((playlist_name, len(tracks)))
+        return {'matched_tracks': 2, 'total_tracks': 2}
+
+    job_id = worker.add_job("Legacy", "sp", sample_tracks, legacy)
+    worker.start()
+    deadline = time.time() + 5
+    while time.time() < deadline and worker.get_job_status(job_id)['status'] != 'completed':
+        time.sleep(0.05)
+    worker.stop()
+
+    assert calls == [("Legacy", 2)]
+    assert worker.get_job_status(job_id)['status'] == 'completed'
 
 
 # ============================================================================

@@ -158,6 +158,18 @@ ENABLE_DESKTOP_NOTIFICATIONS = True
 AUTO_RESUME_INCOMPLETE = True
 """Whether to automatically resume incomplete migrations on startup."""
 
+YOUTUBE_PLAYLIST_MAX_ITEMS = 5000
+"""Hard cap on items in a single YouTube Music playlist.
+
+A source playlist whose matched tracks exceed this is written to several
+destination playlists ("shards") named "<name> (1)", "<name> (2)", ...
+"""
+
+INCREMENTAL_FLUSH_SIZE = 50
+"""Matched tracks are written to YouTube Music as soon as this many have
+accumulated during the search loop, so a crash leaves a partially filled,
+resumable playlist instead of nothing."""
+
 
 # ============================================================================
 # Rate Limiting

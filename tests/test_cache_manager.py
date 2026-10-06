@@ -696,3 +696,75 @@ class TestEdgeCases:
         cache_manager.cache_match('track_1', 'youtube_1', 1.0)
         match = cache_manager.get_cached_match('track_1')
         assert match['confidence'] == 1.0
+
+
+# ============================================================================
+# Test Class: Track order and multi-playlist membership (resume depends on both)
+# ============================================================================
+
+class TestTrackOrderAndMembership:
+    """get_cached_tracks must return source order, and a track in two
+    playlists must be kept for each - a resumed job walks the tracks table."""
+    
+    def test_tracks_come_back_in_source_order(self, cache_manager):
+        tracks = [{'id': f'z{i:03d}', 'name': f'Song {i}', 'artists': []} for i in range(20, 0, -1)]
+        cache_manager.cache_tracks(tracks, 'pl')
+        
+        retrieved = cache_manager.get_cached_tracks('pl')
+        assert [t['id'] for t in retrieved] == [t['id'] for t in tracks]
+    
+    def test_recache_keeps_original_position(self, cache_manager):
+        tracks = [{'id': 'a', 'name': 'A', 'artists': []}, {'id': 'b', 'name': 'B', 'artists': []}]
+        cache_manager.cache_tracks(tracks, 'pl')
+        cache_manager.cache_tracks([{'id': 'a', 'name': 'A2', 'artists': []}], 'pl')
+        
+        retrieved = cache_manager.get_cached_tracks('pl')
+        assert [t['id'] for t in retrieved] == ['a', 'b']
+        assert retrieved[0]['name'] == 'A2'
+    
+    def test_same_track_in_two_playlists_kept_for_both(self, cache_manager):
+        track = [{'id': 'shared', 'name': 'Shared', 'artists': ['X']}]
+        cache_manager.cache_tracks(track, 'pl1')
+        cache_manager.cache_tracks(track, 'pl2')
+        
+        assert [t['id'] for t in cache_manager.get_cached_tracks('pl1')] == ['shared']
+        assert [t['id'] for t in cache_manager.get_cached_tracks('pl2')] == ['shared']
+    
+    def test_legacy_tracks_table_is_upgraded_keeping_rows(self, temp_db_path):
+        """A database created before the composite key / position column is
+        rebuilt in place and its rows survive."""
+        conn = sqlite3.connect(temp_db_path)
+        conn.execute("""
+            CREATE TABLE tracks (
+                spotify_id TEXT PRIMARY KEY,
+                playlist_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                artists TEXT NOT NULL,
+                album TEXT,
+                duration_ms INTEGER,
+                isrc TEXT
+            )
+        """)
+        conn.execute("INSERT INTO tracks VALUES ('old1', 'pl', 'Old One', '[\"A\"]', 'Alb', 1000, NULL)")
+        conn.execute("INSERT INTO tracks VALUES ('old2', 'pl', 'Old Two', '[]', NULL, NULL, NULL)")
+        conn.commit()
+        conn.close()
+        
+        manager = CacheManager(db_path=temp_db_path)
+        try:
+            cursor = manager.connection.cursor()
+            cursor.execute("PRAGMA table_info(tracks)")
+            info = cursor.fetchall()
+            assert 'position' in {row[1] for row in info}
+            assert {row[1] for row in info if row[5]} == {'spotify_id', 'playlist_id'}
+            
+            retrieved = manager.get_cached_tracks('pl')
+            assert [t['id'] for t in retrieved] == ['old1', 'old2']
+            assert retrieved[0]['artists'] == ['A']
+            
+            # Now the same track can live in a second playlist
+            manager.cache_tracks([{'id': 'old1', 'name': 'Old One', 'artists': ['A']}], 'pl2')
+            assert len(manager.get_cached_tracks('pl')) == 2
+            assert len(manager.get_cached_tracks('pl2')) == 1
+        finally:
+            manager.close()

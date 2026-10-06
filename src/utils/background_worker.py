@@ -17,6 +17,8 @@ Example:
     >>> worker.stop()
 """
 
+import inspect
+import json
 import queue
 import threading
 import logging
@@ -61,11 +63,35 @@ class BackgroundWorker:
         self.current_job_lock = threading.Lock()
         self._worker_connection: Optional[sqlite3.Connection] = None  # Thread-local connection
         self.notifier = Notifier(app_name="Spotify to YouTube Music Migrator")
+        # Migrator used when re-queueing interrupted jobs on startup (set by
+        # the owner, e.g. MigrationManager, or passed to resume_incomplete_migrations)
+        self.default_migrator_func: Optional[Callable] = None
+        self.default_progress_callback: Optional[Callable] = None
         
         # Initialize database table for migrations
         self._init_migrations_table()
         
         logger.info("BackgroundWorker initialized")
+    
+    RESUME_COLUMNS = {
+        'youtube_playlist_ids': 'TEXT',
+        'added_tracks': 'INTEGER DEFAULT 0',
+        'last_added_index': 'INTEGER DEFAULT 0',
+        'matched_tracks': 'INTEGER DEFAULT 0',
+        'failed_tracks': 'INTEGER DEFAULT 0',
+    }
+    
+    # Statuses that mean "work still to do" after a restart
+    RESUMABLE_STATUSES = ('queued', 'in_progress')
+    
+    @staticmethod
+    def _ensure_column(cursor: sqlite3.Cursor, table: str, column: str, decl: str) -> None:
+        """Add ``column`` to ``table`` if it is missing (data-preserving)."""
+        cursor.execute(f"PRAGMA table_info({table})")
+        existing = {row[1] for row in cursor.fetchall()}
+        if column not in existing:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+            logger.info(f"Added column {table}.{column}")
     
     def _init_migrations_table(self) -> None:
         """Create migrations table for job persistence if it doesn't exist.
@@ -82,6 +108,12 @@ class BackgroundWorker:
         - started_at: Job start timestamp
         - completed_at: Job completion timestamp
         - error_message: Error message if job failed
+        
+        Resume columns (added with check-and-add so old databases upgrade in place):
+        - youtube_playlist_ids: JSON list of destination playlist ids (one per shard)
+        - added_tracks: Items written to YouTube across all shards
+        - last_added_index: Leading source tracks whose outcome is durable
+        - matched_tracks / failed_tracks: Whole-job counters
         
         Raises:
             sqlite3.Error: If table creation fails.
@@ -105,6 +137,10 @@ class BackgroundWorker:
                         error_message TEXT
                     )
                 """)
+                
+                # Resume columns: add any that an older database lacks
+                for column, decl in self.RESUME_COLUMNS.items():
+                    self._ensure_column(cursor, 'migrations', column, decl)
                 
                 # Create index for status queries
                 cursor.execute("""
@@ -175,7 +211,9 @@ class BackgroundWorker:
         playlist_id: str,
         tracks: List[Dict[str, Any]],
         migrator_func: Callable,
-        progress_callback: Optional[Callable] = None
+        progress_callback: Optional[Callable] = None,
+        job_id: Optional[str] = None,
+        resume_state: Optional[Dict[str, Any]] = None
     ) -> str:
         """Add a new migration job to the queue.
         
@@ -187,8 +225,14 @@ class BackgroundWorker:
             tracks (List[Dict[str, Any]]): List of Spotify tracks to migrate.
             migrator_func (Callable): Function to execute migration.
                 Signature: migrator_func(playlist_name, tracks, progress_callback) -> dict
+                If it also accepts ``resume_state`` and ``state_callback`` keyword
+                arguments they are supplied, enabling incremental persistence.
             progress_callback (Optional[Callable]): Callback for progress updates.
                 Signature: progress_callback(current, total, track_name, matched=0, failed=0) -> None
+            job_id (Optional[str]): Reuse an existing job row instead of
+                inserting a new one (used when resuming after a restart).
+            resume_state (Optional[Dict[str, Any]]): Durable state from the
+                existing row to hand to the migrator (see migrate_playlist).
         
         Returns:
             str: Unique job ID (UUID).
@@ -206,8 +250,9 @@ class BackgroundWorker:
         if not callable(migrator_func):
             raise ValueError("migrator_func must be callable")
         
-        # Generate unique job ID
-        job_id = str(uuid.uuid4())
+        is_resume = job_id is not None
+        if not is_resume:
+            job_id = str(uuid.uuid4())
         
         # Create job dictionary
         job = {
@@ -217,6 +262,7 @@ class BackgroundWorker:
             'tracks': tracks,
             'migrator_func': migrator_func,
             'progress_callback': progress_callback,
+            'resume_state': resume_state,
             'status': 'queued',
             'created_at': datetime.now()
         }
@@ -226,23 +272,32 @@ class BackgroundWorker:
             with self.cache_manager.connection:
                 cursor = self.cache_manager.connection.cursor()
                 
-                cursor.execute("""
-                    INSERT INTO migrations 
-                    (job_id, playlist_name, playlist_id, status, 
-                     total_tracks, processed_tracks, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    job_id,
-                    playlist_name,
-                    playlist_id,
-                    'queued',
-                    len(tracks),
-                    0,
-                    datetime.now()
-                ))
-                
-                logger.info(f"Created migration job {job_id} for '{playlist_name}' "
-                           f"with {len(tracks)} tracks")
+                if is_resume:
+                    cursor.execute("""
+                        UPDATE migrations
+                        SET status = 'queued', total_tracks = ?, error_message = NULL
+                        WHERE job_id = ?
+                    """, (len(tracks), job_id))
+                    logger.info(f"Re-queued migration job {job_id} for '{playlist_name}' "
+                               f"({len(tracks)} tracks)")
+                else:
+                    cursor.execute("""
+                        INSERT INTO migrations 
+                        (job_id, playlist_name, playlist_id, status, 
+                         total_tracks, processed_tracks, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        job_id,
+                        playlist_name,
+                        playlist_id,
+                        'queued',
+                        len(tracks),
+                        0,
+                        datetime.now()
+                    ))
+                    
+                    logger.info(f"Created migration job {job_id} for '{playlist_name}' "
+                               f"with {len(tracks)} tracks")
         
         except sqlite3.Error as e:
             logger.error(f"Failed to create migration job: {str(e)}")
@@ -321,12 +376,17 @@ class BackgroundWorker:
                                 except Exception as e:
                                     logger.error(f"Progress callback error: {str(e)}")
                         
+                        # Persist durable state (playlist ids, last added index)
+                        # whenever the migrator completes a write to YouTube.
+                        def state_callback(**state):
+                            self._update_job_progress(
+                                job_id, None, None,
+                                **{k: v for k, v in state.items()
+                                   if k in self.RESUME_COLUMNS}
+                            )
+                        
                         # Execute migration
-                        result = job['migrator_func'](
-                            job['playlist_name'],
-                            job['tracks'],
-                            progress_wrapper
-                        )
+                        result = self._call_migrator(job, progress_wrapper, state_callback)
                         
                         # Update status to completed
                         self._update_job_status(
@@ -439,20 +499,49 @@ class BackgroundWorker:
             logger.error(f"Failed to update job status: {str(e)}")
             raise
     
+    def _call_migrator(
+        self,
+        job: Dict[str, Any],
+        progress_wrapper: Callable,
+        state_callback: Callable
+    ) -> Dict[str, Any]:
+        """Invoke the job's migrator, passing resume/state kwargs when it takes them.
+        
+        Migrators that only accept (playlist_name, tracks, progress_callback)
+        keep working; ones that declare ``resume_state`` / ``state_callback``
+        get the persisted state and a hook to record new state.
+        """
+        func = job['migrator_func']
+        kwargs: Dict[str, Any] = {}
+        try:
+            params = inspect.signature(func).parameters
+        except (TypeError, ValueError):
+            params = {}
+        if 'resume_state' in params:
+            kwargs['resume_state'] = job.get('resume_state')
+        if 'state_callback' in params:
+            kwargs['state_callback'] = state_callback
+        
+        return func(job['playlist_name'], job['tracks'], progress_wrapper, **kwargs)
+    
     def _update_job_progress(
         self,
         job_id: str,
-        current: int,
-        total: int,
-        last_track_id: Optional[str] = None
+        current: Optional[int],
+        total: Optional[int],
+        last_track_id: Optional[str] = None,
+        **state: Any
     ) -> None:
-        """Update job progress in database.
+        """Update job progress and/or durable resume state in database.
         
         Args:
             job_id (str): Job ID to update.
-            current (int): Number of tracks processed.
-            total (int): Total number of tracks.
+            current (Optional[int]): Number of tracks processed (None = leave as is).
+            total (Optional[int]): Total number of tracks (None = leave as is).
             last_track_id (Optional[str]): Last processed track ID.
+            **state: Any of the RESUME_COLUMNS (youtube_playlist_ids,
+                added_tracks, last_added_index, matched_tracks, failed_tracks).
+                ``youtube_playlist_ids`` may be a list; it is stored as JSON.
         
         Raises:
             sqlite3.Error: If database update fails.
@@ -461,21 +550,39 @@ class BackgroundWorker:
             # Use worker connection if available (in worker thread), otherwise use cache manager connection
             conn = self._worker_connection if self._worker_connection else self.cache_manager.connection
             
+            updates: List[str] = []
+            params: List[Any] = []
+            
+            if current is not None:
+                updates.append("processed_tracks = ?")
+                params.append(current)
+            if total is not None:
+                updates.append("total_tracks = ?")
+                params.append(total)
+            
+            if last_track_id:
+                updates.append("last_track_id = ?")
+                params.append(last_track_id)
+            
+            for column in self.RESUME_COLUMNS:
+                if column in state and state[column] is not None:
+                    value = state[column]
+                    if column == 'youtube_playlist_ids' and not isinstance(value, str):
+                        value = json.dumps(list(value))
+                    updates.append(f"{column} = ?")
+                    params.append(value)
+            
+            if not updates:
+                return
+            
+            params.append(job_id)
+            
             with conn:
                 cursor = conn.cursor()
-                
-                if last_track_id:
-                    cursor.execute("""
-                        UPDATE migrations 
-                        SET processed_tracks = ?, total_tracks = ?, last_track_id = ?
-                        WHERE job_id = ?
-                    """, (current, total, last_track_id, job_id))
-                else:
-                    cursor.execute("""
-                        UPDATE migrations 
-                        SET processed_tracks = ?, total_tracks = ?
-                        WHERE job_id = ?
-                    """, (current, total, job_id))
+                cursor.execute(
+                    f"UPDATE migrations SET {', '.join(updates)} WHERE job_id = ?",
+                    params
+                )
         
         except sqlite3.Error as e:
             logger.error(f"Failed to update job progress: {str(e)}")
@@ -501,34 +608,59 @@ class BackgroundWorker:
                 }
             return None
     
-    def resume_incomplete_migrations(self) -> List[str]:
+    def resume_incomplete_migrations(
+        self,
+        migrator_func: Optional[Callable] = None,
+        progress_callback: Optional[Callable] = None
+    ) -> List[str]:
         """Resume migrations that were interrupted (crash recovery).
         
-        Queries database for jobs with status='in_progress' and re-adds them
-        to the queue. Useful for recovering from application crashes.
+        Finds jobs left 'queued' or 'in_progress' by a previous run and puts
+        them back on the queue so they *continue*: the source tracks are
+        reloaded from the ``tracks`` table (they were cached when the job was
+        first queued), and the job row's durable state (destination playlist
+        ids, items already added, index of the last added track) is handed to
+        the migrator so it skips what is already on YouTube and reuses the
+        existing playlist(s) instead of creating new ones. Already-decided
+        matches come back from ``match_cache`` automatically.
         
-        Note: This should be called after worker.start() to ensure jobs
-        are processed. The actual track data is not persisted, so jobs
-        cannot be fully resumed - they will be marked as failed.
+        A job whose source tracks are no longer cached cannot be continued and
+        is marked failed with an explanatory message. The same happens when no
+        migrator is available (neither ``migrator_func`` nor
+        ``default_migrator_func`` is set).
+        
+        Note: call after worker.start() so re-queued jobs are processed.
+        
+        Args:
+            migrator_func (Optional[Callable]): Migrator to run the resumed jobs
+                with. Defaults to ``self.default_migrator_func``.
+            progress_callback (Optional[Callable]): Progress callback for the
+                resumed jobs. Defaults to ``self.default_progress_callback``.
         
         Returns:
-            List[str]: List of resumed job IDs.
+            List[str]: Job IDs that were found incomplete (re-queued or failed).
         
         Raises:
             sqlite3.Error: If database query fails.
         """
-        resumed_jobs = []
+        resumed_jobs: List[str] = []
+        migrator_func = migrator_func or self.default_migrator_func
+        progress_callback = progress_callback or self.default_progress_callback
         
         try:
             cursor = self.cache_manager.connection.cursor()
             
-            # Find incomplete migrations
-            cursor.execute("""
-                SELECT job_id, playlist_name, playlist_id, total_tracks
+            # Find incomplete migrations (queued-but-never-run jobs were lost
+            # with the in-memory queue, so they are incomplete too)
+            placeholders = ', '.join('?' for _ in self.RESUMABLE_STATUSES)
+            cursor.execute(f"""
+                SELECT job_id, playlist_name, playlist_id, total_tracks,
+                       youtube_playlist_ids, added_tracks, last_added_index,
+                       matched_tracks, failed_tracks
                 FROM migrations
-                WHERE status = 'in_progress'
-                ORDER BY started_at ASC
-            """)
+                WHERE status IN ({placeholders})
+                ORDER BY COALESCE(started_at, created_at) ASC
+            """, self.RESUMABLE_STATUSES)
             
             incomplete_jobs = cursor.fetchall()
             
@@ -538,25 +670,40 @@ class BackgroundWorker:
             
             logger.info(f"Found {len(incomplete_jobs)} incomplete migrations")
             
-            # Mark them as failed (cannot resume without track data)
-            for job in incomplete_jobs:
-                job_id, playlist_name, playlist_id, total_tracks = job
-                
-                self._update_job_status(
-                    job_id,
-                    'failed',
-                    completed_at=datetime.now(),
-                    error_message="Migration interrupted by application crash"
-                )
-                
+            for row in incomplete_jobs:
+                job_id = row['job_id']
+                playlist_name = row['playlist_name']
+                playlist_id = row['playlist_id']
                 resumed_jobs.append(job_id)
                 
-                logger.warning(f"Marked interrupted job {job_id} as failed: '{playlist_name}'")
+                if migrator_func is None:
+                    self._fail_resume(job_id, playlist_name,
+                                      "Migration was interrupted and no migrator is available to resume it.")
+                    continue
                 
-                # Send notification
-                self.notifier.notify_migration_failed(
+                tracks = self.cache_manager.get_cached_tracks(playlist_id)
+                if not tracks:
+                    self._fail_resume(job_id, playlist_name,
+                                      "Migration was interrupted and its source tracks are no longer cached. "
+                                      "Please start it again.")
+                    continue
+                
+                resume_state = self._row_resume_state(row)
+                
+                logger.info(
+                    f"Resuming job {job_id} '{playlist_name}': "
+                    f"{resume_state['last_added_index']}/{len(tracks)} tracks already final, "
+                    f"{len(resume_state['youtube_playlist_ids'])} destination playlist(s)"
+                )
+                
+                self.add_job(
                     playlist_name=playlist_name,
-                    error="Migration was interrupted by application crash. Please try again."
+                    playlist_id=playlist_id,
+                    tracks=tracks,
+                    migrator_func=migrator_func,
+                    progress_callback=progress_callback,
+                    job_id=job_id,
+                    resume_state=resume_state
                 )
         
         except sqlite3.Error as e:
@@ -564,6 +711,33 @@ class BackgroundWorker:
             raise
         
         return resumed_jobs
+    
+    @staticmethod
+    def _row_resume_state(row: sqlite3.Row) -> Dict[str, Any]:
+        """Decode a migrations row's resume columns into a resume_state dict."""
+        raw_ids = row['youtube_playlist_ids']
+        try:
+            playlist_ids = json.loads(raw_ids) if raw_ids else []
+        except (TypeError, ValueError):
+            playlist_ids = []
+        return {
+            'youtube_playlist_ids': playlist_ids,
+            'added_tracks': row['added_tracks'] or 0,
+            'last_added_index': row['last_added_index'] or 0,
+            'matched_tracks': row['matched_tracks'] or 0,
+            'failed_tracks': row['failed_tracks'] or 0,
+        }
+    
+    def _fail_resume(self, job_id: str, playlist_name: str, reason: str) -> None:
+        """Mark an interrupted job failed when it genuinely cannot continue."""
+        self._update_job_status(
+            job_id,
+            'failed',
+            completed_at=datetime.now(),
+            error_message=reason
+        )
+        logger.warning(f"Could not resume interrupted job {job_id} '{playlist_name}': {reason}")
+        self.notifier.notify_migration_failed(playlist_name=playlist_name, error=reason)
     
     def get_job_status(self, job_id: str) -> Dict[str, Any]:
         """Get status of a specific job.
@@ -581,6 +755,10 @@ class BackgroundWorker:
                 - started_at (Optional[datetime]): Job start time
                 - completed_at (Optional[datetime]): Job completion time
                 - error_message (Optional[str]): Error message if failed
+                - youtube_playlist_ids (List[str]): Destination playlist ids (shards)
+                - added_tracks (int): Items written to YouTube so far
+                - last_added_index (int): Source tracks whose outcome is durable
+                - matched_tracks / failed_tracks (int): Whole-job counters
         
         Raises:
             ValueError: If job_id not found.
@@ -591,7 +769,9 @@ class BackgroundWorker:
             
             cursor.execute("""
                 SELECT status, processed_tracks, total_tracks, playlist_name,
-                       created_at, started_at, completed_at, error_message
+                       created_at, started_at, completed_at, error_message,
+                       youtube_playlist_ids, added_tracks, last_added_index,
+                       matched_tracks, failed_tracks
                 FROM migrations
                 WHERE job_id = ?
             """, (job_id,))
@@ -601,17 +781,22 @@ class BackgroundWorker:
             if not row:
                 raise ValueError(f"Job {job_id} not found")
             
-            status, progress, total, playlist_name, created_at, started_at, completed_at, error_message = row
+            resume_state = self._row_resume_state(row)
             
             return {
-                'status': status,
-                'progress': progress,
-                'total': total,
-                'playlist_name': playlist_name,
-                'created_at': created_at,
-                'started_at': started_at,
-                'completed_at': completed_at,
-                'error_message': error_message
+                'status': row['status'],
+                'progress': row['processed_tracks'],
+                'total': row['total_tracks'],
+                'playlist_name': row['playlist_name'],
+                'created_at': row['created_at'],
+                'started_at': row['started_at'],
+                'completed_at': row['completed_at'],
+                'error_message': row['error_message'],
+                'youtube_playlist_ids': resume_state['youtube_playlist_ids'],
+                'added_tracks': resume_state['added_tracks'],
+                'last_added_index': resume_state['last_added_index'],
+                'matched_tracks': resume_state['matched_tracks'],
+                'failed_tracks': resume_state['failed_tracks'],
             }
         
         except sqlite3.Error as e:

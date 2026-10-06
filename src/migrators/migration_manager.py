@@ -148,9 +148,15 @@ class MigrationManager:
         )
         logger.info("Initialized PlaylistMigrator")
         
-        # Initialize background worker
+        # Initialize background worker. It gets the migrator so jobs interrupted
+        # by a crash/restart can be re-queued and continued on start().
         self.background_worker = BackgroundWorker(cache_manager=cache_manager)
+        self.background_worker.default_migrator_func = self.playlist_migrator.migrate_playlist
         logger.info("Initialized BackgroundWorker")
+        
+        # UI progress callback for jobs resumed on startup (set via
+        # set_progress_callback(); the UI may attach after start()).
+        self._resume_progress_callback: Optional[Callable] = None
         
         # Initialize notifier
         self.notifier = Notifier(app_name="Spotify to YouTube Music Migrator")
@@ -179,7 +185,9 @@ class MigrationManager:
         
         This method:
         1. Starts the background worker thread
-        2. Resumes any incomplete migrations from crashes
+        2. Re-queues any migrations interrupted by a crash or restart so they
+           continue from the last track written to YouTube (no duplicate
+           playlists, already-added tracks skipped)
         3. Logs startup information
         
         Should be called before queueing any migration jobs.
@@ -198,14 +206,46 @@ class MigrationManager:
         self.background_worker.start()
         logger.info("Background worker started")
         
-        # Resume incomplete migrations (crash recovery)
-        resumed_jobs = self.background_worker.resume_incomplete_migrations()
+        # Resume incomplete migrations (crash recovery): they continue where
+        # they left off rather than being marked failed.
+        resumed_jobs = self.background_worker.resume_incomplete_migrations(
+            migrator_func=self.playlist_migrator.migrate_playlist,
+            progress_callback=self._make_resume_progress_wrapper()
+        )
         if resumed_jobs:
-            logger.warning(f"Marked {len(resumed_jobs)} interrupted migrations as failed")
+            logger.info(f"Re-queued {len(resumed_jobs)} interrupted migration(s) to continue")
         else:
             logger.info("No incomplete migrations to resume")
         
         logger.info("MigrationManager started successfully")
+    
+    def set_progress_callback(
+        self,
+        progress_callback: Optional[Callable[[str, int, int, str], None]]
+    ) -> None:
+        """Attach the UI progress callback used for jobs resumed on startup.
+        
+        Jobs queued through migrate_playlists() carry their own callback; this
+        one covers jobs that were re-queued by start() before the UI existed.
+        Signature: progress_callback(playlist_name, current, total, track_name,
+        matched=0, failed=0).
+        """
+        self._resume_progress_callback = progress_callback
+    
+    def _make_resume_progress_wrapper(self) -> Callable:
+        """Worker-style progress callback that forwards resumed jobs' progress
+        to whatever UI callback is attached at call time."""
+        def wrapper(current: int, total: int, track_name: str, matched: int = 0, failed: int = 0):
+            callback = self._resume_progress_callback
+            if not callback:
+                return
+            current_job = self.background_worker.get_current_job() or {}
+            pname = current_job.get('playlist_name', '')
+            try:
+                callback(pname, current, total, track_name, matched, failed)
+            except Exception as e:
+                logger.error(f"Progress callback error for resumed job '{pname}': {str(e)}")
+        return wrapper
     
     def stop(self, timeout: float = 30.0) -> None:
         """Stop the migration manager gracefully.
@@ -323,6 +363,17 @@ class MigrationManager:
                 if not tracks:
                     logger.warning(f"Playlist '{playlist_name}' has no tracks, skipping")
                     continue
+                
+                # Make sure the source tracks are in the tracks table: resume
+                # after a restart reloads them from there. Fetched tracks are
+                # already cached by SpotifyFetcher; pre-fetched ones are not.
+                try:
+                    self.cache_manager.cache_tracks(tracks, playlist_id)
+                except Exception as e:
+                    logger.warning(
+                        f"Could not cache tracks for '{playlist_name}' "
+                        f"(resume after restart will not be possible): {str(e)}"
+                    )
                 
                 # Create progress wrapper that forwards to user callback
                 def create_progress_wrapper(pname: str):

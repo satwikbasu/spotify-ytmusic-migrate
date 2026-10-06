@@ -741,24 +741,19 @@ def test_batch_addition_logic(
     # 1. All 250 tracks processed
     assert report['total_tracks'] == 250
     
-    # 2. Tracks added in batches (250 tracks = 3 batches: 100, 100, 50)
+    # 2. Tracks are written incrementally: every FLUSH_SIZE matches become one
+    #    add_playlist_items call (250 tracks / 50 per flush = 5 calls), so a
+    #    crash mid-search leaves a partially populated playlist.
     add_calls = mock_ytmusic_client.add_playlist_items.call_args_list
-    assert len(add_calls) == 3
-    
-    # 3. First two batches should have 100 tracks each
+    assert len(add_calls) == 250 // PlaylistMigrator.FLUSH_SIZE
+
+    # 3. No call may exceed the 100-item API limit
     # Note: add_playlist_items is called with (playlistId=..., videoIds=...)
-    # Extract videoIds from kwargs
-    batch_1_size = len(add_calls[0].kwargs['videoIds']) if len(add_calls) > 0 else 0
-    batch_2_size = len(add_calls[1].kwargs['videoIds']) if len(add_calls) > 1 else 0
-    batch_3_size = len(add_calls[2].kwargs['videoIds']) if len(add_calls) > 2 else 0
-    
-    assert batch_1_size <= 100
-    assert batch_2_size <= 100
-    assert batch_3_size <= 100
-    
+    batch_sizes = [len(c.kwargs['videoIds']) for c in add_calls]
+    assert all(size <= PlaylistMigrator.BATCH_SIZE for size in batch_sizes)
+
     # Total should be number of matched tracks
-    total_added = batch_1_size + batch_2_size + batch_3_size
-    assert total_added == report['matched_tracks']
+    assert sum(batch_sizes) == report['matched_tracks']
 
 
 # ============================================================================
