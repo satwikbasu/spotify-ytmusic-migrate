@@ -527,3 +527,58 @@ class TestResultsScreenEdgeCases:
         
         card = screen_detailed._build_playlist_result_card(incomplete_result)
         assert card is not None
+
+
+class TestAggregateResultsShape:
+    """The progress screen hands over count-only per-playlist results (per-track
+    detail is not persisted) plus shard / failed-playlist totals. The Results
+    screen must render that shape without a failed_tracks list."""
+
+    def _page(self):
+        page = Mock(spec=ft.Page)
+        page.overlay = []
+        page.update = Mock()
+        return page
+
+    def test_renders_count_only_failures_and_shards(self):
+        app_state = {
+            'migration_results': {
+                'total_playlists': 2, 'total_tracks': 80, 'matched_count': 78,
+                'failed_count': 2, 'playlists_created': 3, 'failed_playlists': 1,
+                'duration': 120,
+            },
+            'playlist_results': [
+                {'name': 'Rock', 'status': 'completed', 'total_tracks': 50,
+                 'matched_tracks': 48, 'failed_count': 2, 'failed_tracks': [],
+                 'youtube_playlist_ids': ['a'], 'shard_count': 1,
+                 'youtube_playlist_url': 'https://music.youtube.com/playlist?list=a'},
+                {'name': 'Pop', 'status': 'failed', 'total_tracks': 30,
+                 'matched_tracks': 30, 'failed_count': 0, 'failed_tracks': [],
+                 'youtube_playlist_ids': ['b', 'c'], 'shard_count': 2,
+                 'youtube_playlist_url': 'https://music.youtube.com/playlist?list=b'},
+            ],
+        }
+        screen = ResultsScreen(self._page(), app_state)
+        content = screen.build()
+        assert content is not None
+        assert screen.playlists_created == 3
+        assert screen.failed_playlists == 1
+
+        card = screen._build_playlist_result_card(app_state['playlist_results'][1])
+        texts = []
+
+        def walk(c):
+            if hasattr(c, 'value') and isinstance(getattr(c, 'value'), str):
+                texts.append(c.value)
+            for attr in ('content', 'controls'):
+                child = getattr(c, attr, None)
+                if child is None:
+                    continue
+                for item in (child if isinstance(child, list) else [child]):
+                    walk(item)
+        walk(card)
+        joined = " | ".join(texts)
+        assert "split into 2 playlists" in joined
+        assert "stopped early" in joined
+        # No "View N failed" button when there is no per-track list
+        assert "View" not in joined

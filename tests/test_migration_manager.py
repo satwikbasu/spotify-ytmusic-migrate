@@ -770,3 +770,98 @@ def test_stop_closes_rate_limiter(manager):
 def test_stop_survives_rate_limiter_close_failure(manager):
     manager.rate_limiter.close = Mock(side_effect=RuntimeError('db gone'))
     manager.stop()  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# get_batch_progress: aggregate over one run's job rows (CONTEXT_CONTRACT §4.3,
+# multi-playlist completion). Read-only; paused_auth is never terminal.
+# ---------------------------------------------------------------------------
+
+def _row(status, progress, total, matched=0, failed=0, ids=None, name='P', error=None):
+    return {
+        'status': status, 'progress': progress, 'total': total,
+        'playlist_name': name, 'created_at': None, 'started_at': None,
+        'completed_at': None, 'error_message': error,
+        'youtube_playlist_ids': list(ids or []), 'added_tracks': 0,
+        'last_added_index': 0, 'matched_tracks': matched, 'failed_tracks': failed,
+    }
+
+
+class TestGetBatchProgress:
+
+    def _manager_with_rows(self, manager, rows):
+        rows_by_id = dict(rows)
+
+        def get_job_status(job_id):
+            if job_id not in rows_by_id:
+                raise ValueError(f"Job {job_id} not found")
+            return rows_by_id[job_id]
+
+        manager.background_worker.get_job_status = Mock(side_effect=get_job_status)
+        manager.get_throttle_state = Mock(return_value={
+            'throttled': False, 'reason': None, 'until': None, 'message': ''
+        })
+        return manager
+
+    def test_sums_across_jobs_and_is_not_done_mid_run(self, manager):
+        self._manager_with_rows(manager, [
+            ('j1', _row('completed', 50, 50, 48, 2, ids=['a'], name='Rock')),
+            ('j2', _row('in_progress', 10, 30, 9, 1, ids=['b'], name='Pop')),
+            ('j3', _row('queued', 0, 20, name='Jazz')),
+        ])
+        b = manager.get_batch_progress(['j1', 'j2', 'j3'])
+        assert b['total_jobs'] == 3
+        assert (b['completed_jobs'], b['in_progress_jobs'], b['queued_jobs']) == (1, 1, 1)
+        assert b['total_tracks'] == 100
+        assert b['processed_tracks'] == 60
+        assert b['matched_tracks'] == 57
+        assert b['failed_tracks'] == 3
+        assert b['playlists_created'] == 2
+        assert b['all_done'] is False
+        assert b['auth_required'] is False
+        assert [j['playlist_name'] for j in b['jobs']] == ['Rock', 'Pop', 'Jazz']
+        assert b['jobs'][0]['youtube_playlist_ids'] == ['a']
+
+    def test_all_done_when_every_job_completed_or_failed(self, manager):
+        self._manager_with_rows(manager, [
+            ('j1', _row('completed', 50, 50, 50, 0, ids=['a', 'b'])),
+            ('j2', _row('failed', 12, 30, 11, 1, error='boom')),
+        ])
+        b = manager.get_batch_progress(['j1', 'j2'])
+        assert b['all_done'] is True
+        assert b['failed_jobs'] == 1
+        assert b['processed_tracks'] == 62   # completed counts full total
+        assert b['playlists_created'] == 2   # the sharded one
+        assert b['jobs'][1]['error_message'] == 'boom'
+
+    def test_paused_auth_is_not_done_and_flags_auth_required(self, manager):
+        self._manager_with_rows(manager, [
+            ('j1', _row('completed', 50, 50, 50, 0)),
+            ('j2', _row('paused_auth', 10, 30, 9, 1)),
+        ])
+        b = manager.get_batch_progress(['j1', 'j2'])
+        assert b['all_done'] is False
+        assert b['paused_auth_jobs'] == 1
+        assert b['auth_required'] is True
+
+    def test_unknown_job_ids_are_skipped(self, manager):
+        self._manager_with_rows(manager, [('j1', _row('completed', 5, 5, 5, 0))])
+        b = manager.get_batch_progress(['j1', 'missing'])
+        assert b['total_jobs'] == 1
+        assert b['all_done'] is True
+
+    def test_empty_job_list_is_never_done(self, manager):
+        self._manager_with_rows(manager, [])
+        b = manager.get_batch_progress([])
+        assert b['total_jobs'] == 0
+        assert b['all_done'] is False
+        assert b['total_tracks'] == 0
+
+    def test_includes_throttle_state(self, manager):
+        self._manager_with_rows(manager, [('j1', _row('in_progress', 1, 5))])
+        manager.get_throttle_state = Mock(return_value={
+            'throttled': True, 'reason': 'rate', 'until': 123.0, 'message': 'slow'
+        })
+        b = manager.get_batch_progress(['j1'])
+        assert b['throttle']['throttled'] is True
+        assert b['all_done'] is False

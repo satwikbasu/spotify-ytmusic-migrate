@@ -232,11 +232,13 @@ class TestMigrationProgressScreenUIUpdates:
     def test_update_ui_updates_progress_bar(self, screen):
         """Test that UI update changes progress bar."""
         screen.build()
-        screen.current_track_index = 40
+        # The bar is OVERALL progress (all playlists), not the per-playlist index
+        screen.processed_tracks = 40
+        screen.current_track_index = 3
         screen.total_tracks = 80
-        
+
         screen._update_ui()
-        
+
         # Should update to 50% (40/80)
         assert screen.progress_bar.value == 0.5
         assert screen.progress_bar.progress_bar.value == 0.5
@@ -579,3 +581,352 @@ class TestMigrationProgressScreenAppStateWiring:
         # is_migration_active() / SleepGuard read in main.py.
         assert app_state['migration_manager'] is fake_manager
         assert screen.migration_manager is fake_manager
+
+
+# ---------------------------------------------------------------------------
+# Multi-playlist completion + waiting-state visibility (CONTEXT_CONTRACT §4.3,
+# "multi-playlist completion"; §1 seamless status). The screen drives the
+# overall bar and the done decision from MigrationManager.get_batch_progress()
+# over this run's job rows, never from one playlist's track index.
+# ---------------------------------------------------------------------------
+
+def _job(name, status, processed, total, matched, failed, ids=None, error=None):
+    return {
+        'job_id': f'job-{name}',
+        'playlist_name': name,
+        'status': status,
+        'processed_tracks': processed,
+        'total_tracks': total,
+        'matched_tracks': matched,
+        'failed_tracks': failed,
+        'youtube_playlist_ids': list(ids or []),
+        'error_message': error,
+    }
+
+
+def _batch(jobs, throttle=None):
+    completed = sum(1 for j in jobs if j['status'] == 'completed')
+    failed = sum(1 for j in jobs if j['status'] == 'failed')
+    paused = sum(1 for j in jobs if j['status'] == 'paused_auth')
+    return {
+        'total_jobs': len(jobs),
+        'completed_jobs': completed,
+        'failed_jobs': failed,
+        'in_progress_jobs': sum(1 for j in jobs if j['status'] == 'in_progress'),
+        'queued_jobs': sum(1 for j in jobs if j['status'] == 'queued'),
+        'paused_auth_jobs': paused,
+        'processed_tracks': sum(
+            j['total_tracks'] if j['status'] == 'completed' else j['processed_tracks']
+            for j in jobs
+        ),
+        'total_tracks': sum(j['total_tracks'] for j in jobs),
+        'matched_tracks': sum(j['matched_tracks'] for j in jobs),
+        'failed_tracks': sum(j['failed_tracks'] for j in jobs),
+        'playlists_created': sum(len(j['youtube_playlist_ids']) for j in jobs),
+        'all_done': bool(jobs) and completed + failed == len(jobs),
+        'auth_required': paused > 0,
+        'throttle': throttle or {'throttled': False, 'reason': None, 'until': None, 'message': ''},
+        'jobs': jobs,
+    }
+
+
+def _status(auth_required=False, throttle=None):
+    return {
+        'total_jobs': 2, 'completed_jobs': 0, 'failed_jobs': 0, 'queued_jobs': 0,
+        'in_progress_jobs': 1, 'current_job': None, 'queue_size': 0,
+        'is_paused': False, 'error_count': 0, 'is_running': True,
+        'throttle': throttle or {'throttled': False, 'reason': None, 'until': None, 'message': ''},
+        'paused_auth_jobs': 1 if auth_required else 0,
+        'auth_required': auth_required,
+    }
+
+
+@pytest.fixture
+def polling_screen(screen):
+    """A built screen wired to a mocked MigrationManager with two jobs."""
+    screen.build()
+    screen.page.update = Mock()
+    screen.migration_manager = Mock()
+    screen.job_ids = ['job-Rock Classics', 'job-Pop Hits']
+    screen.start_time = time.time() - 60
+    screen.total_playlists = 2
+    # Never let the real timers fire in tests
+    screen._schedule_poll = Mock()
+    return screen
+
+
+class TestMultiPlaylistCompletion:
+
+    def test_mid_run_two_playlists_is_not_complete_and_bar_is_overall(self, polling_screen):
+        s = polling_screen
+        jobs = [
+            _job('Rock Classics', 'completed', 50, 50, 48, 2, ids=['yt1']),
+            _job('Pop Hits', 'in_progress', 10, 30, 9, 1, ids=['yt2']),
+        ]
+        s.migration_manager.get_batch_progress.return_value = _batch(jobs)
+        s.migration_manager.get_migration_status.return_value = _status()
+
+        done = s.refresh_from_manager()
+
+        assert done is False
+        assert s.total_tracks == 80
+        assert s.processed_tracks == 60
+        assert s.matched_count == 57
+        assert s.failed_count == 3
+        # 60/80 = 75% overall, not 10/30 of the current playlist
+        assert s.progress_bar.value == 0.75
+        assert "75%" in s.progress_bar.text_label.value
+        # Current playlist is the running one (index 1 -> "2 of 2")
+        assert "Playlist 2 of 2: Pop Hits" in s.playlist_text.value
+        assert "across 2 playlists" in s.overall_text.value
+        assert s.wait_banner_holder.visible is False
+        s.migration_manager.get_batch_progress.assert_called_once_with(s.job_ids)
+
+    def test_two_playlists_all_done_navigates_to_results_with_aggregates(self, polling_screen):
+        s = polling_screen
+        jobs = [
+            _job('Rock Classics', 'completed', 50, 50, 48, 2, ids=['yt1']),
+            _job('Pop Hits', 'completed', 30, 30, 30, 0, ids=['yt2a', 'yt2b']),
+        ]
+        s.migration_manager.get_batch_progress.return_value = _batch(jobs)
+        s.migration_manager.get_migration_status.return_value = _status()
+
+        assert s.refresh_from_manager() is True
+        assert s.progress_bar.value == 1.0
+
+        with patch.object(s, 'navigate_to') as nav:
+            s.on_migration_complete(batch=s.last_batch)
+
+            from src.ui.screens.results_screen import ResultsScreen
+            nav.assert_called_once()
+            assert nav.call_args[0][0] == ResultsScreen
+
+        r = s.app_state['migration_results']
+        assert r['total_playlists'] == 2
+        assert r['total_tracks'] == 80
+        assert r['matched_count'] == 78
+        assert r['failed_count'] == 2
+        assert r['playlists_created'] == 3   # one playlist was sharded
+        assert r['failed_playlists'] == 0
+        assert r['duration'] > 0
+
+        per = s.app_state['playlist_results']
+        assert [p['name'] for p in per] == ['Rock Classics', 'Pop Hits']
+        assert per[0]['matched_tracks'] == 48 and per[0]['failed_count'] == 2
+        assert per[0]['youtube_playlist_url'].endswith('list=yt1')
+        assert per[1]['shard_count'] == 2
+
+    def test_poll_cycle_finishes_once_all_jobs_terminal(self, polling_screen):
+        """Simulate the poll: progress, progress, then all done -> _finish."""
+        s = polling_screen
+        running = _batch([
+            _job('Rock Classics', 'in_progress', 20, 50, 19, 1),
+            _job('Pop Hits', 'queued', 0, 30, 0, 0),
+        ])
+        done = _batch([
+            _job('Rock Classics', 'completed', 50, 50, 48, 2, ids=['a']),
+            _job('Pop Hits', 'failed', 12, 30, 11, 1, ids=['b'], error='boom'),
+        ])
+        s.migration_manager.get_batch_progress.side_effect = [running, running, done]
+        s.migration_manager.get_migration_status.return_value = _status()
+
+        with patch.object(s, '_finish') as finish:
+            s._poll_status()
+            s._poll_status()
+            assert finish.call_count == 0
+            assert s._schedule_poll.call_count == 2
+            s._poll_status()
+            finish.assert_called_once()
+            # A failed playlist still counts as terminal: the batch is done
+            assert finish.call_args[0][0]['all_done'] is True
+
+    def test_finish_schedules_completion_and_stops_polling(self, polling_screen):
+        s = polling_screen
+        with patch('src.ui.screens.migration_progress_screen.threading.Timer') as timer_cls:
+            s._finish({'all_done': True, 'jobs': []})
+            timer_cls.assert_called_once()
+            assert timer_cls.call_args[0][1] == s.on_migration_complete
+            timer_cls.return_value.start.assert_called_once()
+        assert s.is_complete is True
+        # Second call is a no-op
+        with patch('src.ui.screens.migration_progress_screen.threading.Timer') as timer_cls:
+            s._finish({'all_done': True, 'jobs': []})
+            timer_cls.assert_not_called()
+
+    def test_single_playlist_still_completes(self, polling_screen):
+        s = polling_screen
+        s.job_ids = ['job-Only']
+        s.total_playlists = 1
+        jobs = [_job('Only', 'completed', 14, 14, 14, 0, ids=['yt'])]
+        s.migration_manager.get_batch_progress.return_value = _batch(jobs)
+        s.migration_manager.get_migration_status.return_value = _status()
+
+        assert s.refresh_from_manager() is True
+        assert s.progress_bar.value == 1.0
+        assert s.playlist_text.value == "Only"          # no "1 of 1" prefix
+        assert s.track_text.value == "Track 14 of 14"
+
+        with patch.object(s, 'navigate_to') as nav:
+            s.on_migration_complete(batch=s.last_batch)
+            nav.assert_called_once()
+        assert s.app_state['migration_results']['total_tracks'] == 14
+        assert s.app_state['migration_results']['matched_count'] == 14
+
+    def test_per_track_callback_never_completes_the_batch(self, polling_screen):
+        """The per-playlist index reaching the global total must not finish."""
+        s = polling_screen
+        s.total_tracks = 80
+        s.last_update_time = 0
+        with patch.object(s, 'on_migration_complete') as complete, \
+             patch.object(s, '_finish') as finish:
+            s.on_progress_update("Rock Classics", 80, 80, "Last song")
+            time.sleep(0.05)
+            complete.assert_not_called()
+            finish.assert_not_called()
+        assert s.track_text.value == "Track 80 of 80"
+
+    def test_on_migration_complete_without_batch_uses_screen_counters(self, screen):
+        screen.total_playlists = 1
+        screen.total_tracks = 12
+        screen.matched_count = 12
+        screen.failed_count = 0
+        screen.start_time = time.time()
+        with patch.object(screen, 'navigate_to'):
+            screen.on_migration_complete()
+        assert screen.app_state['migration_results']['matched_count'] == 12
+        assert screen.app_state['playlist_results'] == []
+
+    def test_cancelled_screen_ignores_completion(self, polling_screen):
+        s = polling_screen
+        s.is_cancelled = True
+        with patch.object(s, 'navigate_to') as nav:
+            s.on_migration_complete(batch=_batch([_job('A', 'completed', 1, 1, 1, 0)]))
+            nav.assert_not_called()
+
+    def test_start_migration_begins_polling_and_handles_empty_queue(self, screen, app_state):
+        import asyncio
+        fake_manager = Mock()
+        fake_manager.migrate_playlists.return_value = ['j1', 'j2']
+        with patch('src.ui.screens.migration_progress_screen.MigrationManager',
+                   return_value=fake_manager):
+            screen.show_loading = Mock()
+            screen.show_error = Mock()
+            screen._schedule_poll = Mock()
+            asyncio.run(screen.start_migration())
+        assert screen.job_ids == ['j1', 'j2']
+        assert app_state['migration_job_ids'] == ['j1', 'j2']
+        screen._schedule_poll.assert_called_once()
+        screen.show_error.assert_not_called()
+
+        # Nothing queued (all playlists empty): tell the user, don't poll
+        screen2 = MigrationProgressScreen(screen.page, dict(app_state))
+        fake_manager.migrate_playlists.return_value = []
+        with patch('src.ui.screens.migration_progress_screen.MigrationManager',
+                   return_value=fake_manager):
+            screen2.show_loading = Mock()
+            screen2.show_error = Mock()
+            screen2._schedule_poll = Mock()
+            asyncio.run(screen2.start_migration())
+        screen2.show_error.assert_called_once()
+        screen2._schedule_poll.assert_not_called()
+
+
+class TestWaitingStateBanners:
+
+    def test_paused_auth_shows_reconnect_banner_and_is_not_complete(self, polling_screen):
+        s = polling_screen
+        jobs = [
+            _job('Rock Classics', 'completed', 50, 50, 48, 2, ids=['yt1']),
+            _job('Pop Hits', 'paused_auth', 10, 30, 9, 1, ids=['yt2'],
+                 error='YouTube Music sign-in expired - reconnect to resume'),
+        ]
+        s.migration_manager.get_batch_progress.return_value = _batch(jobs)
+        s.migration_manager.get_migration_status.return_value = _status(auth_required=True)
+
+        done = s.refresh_from_manager()
+
+        assert done is False
+        assert s.is_complete is False
+        assert s.wait_banner_holder.visible is True
+        banner = s.wait_banner_holder.content
+        from src.ui.components import StatusBanner
+        assert isinstance(banner, StatusBanner)
+        assert "sign-in expired" in banner.message
+        assert "reconnect" in banner.message.lower()
+        assert banner.banner_type == "error"
+        # Non-technical: no jargon in what the user sees
+        for word in ("401", "403", "token", "cookie", "SAPISID", "header", "json"):
+            assert word.lower() not in banner.message.lower()
+        assert "reconnect" in s.time_text.value.lower()
+        # The paused playlist is the "current" one
+        assert "Pop Hits" in s.playlist_text.value
+
+    def test_throttled_shows_waiting_until_banner_and_is_not_complete(self, polling_screen):
+        s = polling_screen
+        from datetime import datetime
+        until = time.time() + 15 * 60
+        expected_hhmm = datetime.fromtimestamp(until).strftime('%H:%M')
+        throttle = {'throttled': True, 'reason': 'rate', 'until': until,
+                    'message': 'Rate limited by YouTube Music'}
+        jobs = [
+            _job('Rock Classics', 'in_progress', 20, 50, 19, 1),
+            _job('Pop Hits', 'queued', 0, 30, 0, 0),
+        ]
+        s.migration_manager.get_batch_progress.return_value = _batch(jobs, throttle=throttle)
+        s.migration_manager.get_migration_status.return_value = _status(throttle=throttle)
+
+        assert s.refresh_from_manager() is False
+        assert s.wait_banner_holder.visible is True
+        banner = s.wait_banner_holder.content
+        assert banner.message.startswith("Waiting")
+        assert f"throttled until {expected_hhmm}" in banner.message
+        assert banner.banner_type == "warning"
+
+    def test_throttled_without_until_falls_back_to_message(self, screen):
+        text = screen._throttle_message({'throttled': True, 'until': None,
+                                         'message': 'slowing down for a moment'})
+        assert text == "Waiting — slowing down for a moment"
+        text = screen._throttle_message({'throttled': True, 'until': None, 'message': ''})
+        assert text.startswith("Waiting")
+
+    def test_auth_banner_takes_precedence_over_throttle(self, polling_screen):
+        s = polling_screen
+        throttle = {'throttled': True, 'reason': 'rate', 'until': time.time() + 60, 'message': 'x'}
+        jobs = [_job('A', 'paused_auth', 1, 10, 1, 0)]
+        s.migration_manager.get_batch_progress.return_value = _batch(jobs, throttle=throttle)
+        s.migration_manager.get_migration_status.return_value = _status(auth_required=True, throttle=throttle)
+        s.refresh_from_manager()
+        assert s.wait_banner_kind == 'auth'
+
+    def test_banner_clears_on_refresh_when_state_recovers(self, polling_screen):
+        s = polling_screen
+        jobs = [_job('A', 'paused_auth', 1, 10, 1, 0)]
+        s.migration_manager.get_batch_progress.return_value = _batch(jobs)
+        s.migration_manager.get_migration_status.return_value = _status(auth_required=True)
+        s.refresh_from_manager()
+        assert s.wait_banner_holder.visible is True
+
+        # Reconnected: job back in progress on the next poll
+        jobs = [_job('A', 'in_progress', 4, 10, 4, 0)]
+        s.migration_manager.get_batch_progress.return_value = _batch(jobs)
+        s.migration_manager.get_migration_status.return_value = _status()
+        s.refresh_from_manager()
+        assert s.wait_banner_holder.visible is False
+        assert s.wait_banner_holder.content is None
+        assert s.time_text.value.startswith("Estimated time")
+
+    def test_banner_is_rebuilt_only_on_change(self, polling_screen):
+        s = polling_screen
+        jobs = [_job('A', 'paused_auth', 1, 10, 1, 0)]
+        s.migration_manager.get_batch_progress.return_value = _batch(jobs)
+        s.migration_manager.get_migration_status.return_value = _status(auth_required=True)
+        s.refresh_from_manager()
+        first = s.wait_banner_holder.content
+        s.refresh_from_manager()
+        assert s.wait_banner_holder.content is first
+
+    def test_refresh_without_manager_or_jobs_is_a_noop(self, screen):
+        assert screen.refresh_from_manager() is False
+        screen.migration_manager = Mock()
+        assert screen.refresh_from_manager() is False
+        screen.migration_manager.get_batch_progress.assert_not_called()

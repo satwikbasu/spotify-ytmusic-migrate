@@ -83,7 +83,10 @@ class ResultsScreen(BaseScreen):
         self.matched_count = migration_results.get('matched_count', 0)
         self.failed_count = migration_results.get('failed_count', 0)
         self.duration = migration_results.get('duration', 0)
-        
+        # Destination playlists actually created (incl. 5k shards); 0 = unknown
+        self.playlists_created = migration_results.get('playlists_created', 0)
+        self.failed_playlists = migration_results.get('failed_playlists', 0)
+
         # Calculate success rate
         if self.total_tracks > 0:
             self.success_rate = self.matched_count / self.total_tracks
@@ -196,6 +199,55 @@ class ResultsScreen(BaseScreen):
                 ],
                 spacing=10
             ),
+        ]
+
+        # Large libraries are split into several YouTube Music playlists
+        # (5,000-song cap). Say so when it happened.
+        if self.playlists_created and self.playlists_created != self.total_playlists:
+            summary_items.append(
+                ft.Row(
+                    controls=[
+                        ft.Icon(
+                            name=ft.Icons.QUEUE_MUSIC,
+                            color=app_config.TEXT_COLOR_LIGHT,
+                            size=20
+                        ),
+                        ft.Text(
+                            value=(
+                                f"{self.playlists_created} YouTube Music playlist"
+                                f"{'s' if self.playlists_created != 1 else ''} created "
+                                "(large playlists were split)"
+                            ),
+                            size=app_config.BODY_SIZE,
+                            color=app_config.TEXT_COLOR_LIGHT
+                        )
+                    ],
+                    spacing=10
+                )
+            )
+        if self.failed_playlists:
+            summary_items.append(
+                ft.Row(
+                    controls=[
+                        ft.Icon(
+                            name=ft.Icons.WARNING,
+                            color=app_config.WARNING_COLOR,
+                            size=20
+                        ),
+                        ft.Text(
+                            value=(
+                                f"{self.failed_playlists} playlist"
+                                f"{'s' if self.failed_playlists != 1 else ''} could not be "
+                                "finished — see the list below"
+                            ),
+                            size=app_config.BODY_SIZE,
+                            color=app_config.TEXT_COLOR_LIGHT
+                        )
+                    ],
+                    spacing=10
+                )
+            )
+        summary_items += [
             ft.Row(
                 controls=[
                     ft.Icon(
@@ -291,13 +343,24 @@ class ResultsScreen(BaseScreen):
         total = result.get('total_tracks', 0)
         matched = result.get('matched_tracks', 0)
         failed_tracks = result.get('failed_tracks', [])
+        # Aggregate results carry a count only (per-track detail is not
+        # persisted); detailed results carry the list.
+        failed_count = result.get('failed_count', len(failed_tracks))
         youtube_url = result.get('youtube_playlist_url', '')
-        
+        shard_count = result.get('shard_count', 0)
+        job_failed = result.get('status') == 'failed'
+
         # Calculate success rate
         success_rate = (matched / total * 100) if total > 0 else 0
-        
+
+        stats_text = f"{matched}/{total} songs ({success_rate:.1f}%)"
+        if shard_count and shard_count > 1:
+            stats_text += f" · split into {shard_count} playlists"
+        if job_failed:
+            stats_text += " · stopped early"
+
         # Success icon
-        if len(failed_tracks) == 0:
+        if failed_count == 0 and not job_failed:
             icon = ft.Icon(
                 name=ft.Icons.CHECK_CIRCLE,
                 color=app_config.SUCCESS_COLOR,
@@ -323,7 +386,7 @@ class ResultsScreen(BaseScreen):
                             color=app_config.TEXT_COLOR_LIGHT
                         ),
                         ft.Text(
-                            value=f"{matched}/{total} songs ({success_rate:.1f}%)",
+                            value=stats_text,
                             size=app_config.CAPTION_SIZE,
                             color=app_config.TEXT_COLOR_LIGHT
                         )

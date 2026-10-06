@@ -586,6 +586,93 @@ class MigrationManager:
 
         return status
 
+    # Job statuses after which a job will never do more work.
+    TERMINAL_STATUSES = ('completed', 'failed')
+
+    def get_batch_progress(self, job_ids: List[str]) -> Dict[str, Any]:
+        """Aggregate progress for one run's jobs (read-only, from the job rows).
+
+        The UI queues N playlists and gets back N job ids; this sums their
+        persisted ``processed_tracks``/``total_tracks``/``matched_tracks``/
+        ``failed_tracks`` so a multi-playlist run has one progress bar and one
+        "is the whole batch done?" answer (contract §4.3, multi-playlist
+        completion). Per-track callbacks are per playlist and cannot answer
+        that; the job table can, and it is also correct for jobs resumed after
+        a restart.
+
+        ``all_done`` is True only when every job is ``completed`` or
+        ``failed``. A ``paused_auth`` job (reconnect needed) or a job that is
+        ``in_progress`` while the rate limiter holds it back is NOT done; the
+        ``auth_required`` and ``throttle`` keys say why the batch is waiting.
+
+        Args:
+            job_ids: Job ids returned by ``migrate_playlists()``. Unknown ids
+                are skipped.
+
+        Returns:
+            Dict with keys: ``total_jobs``, ``completed_jobs``, ``failed_jobs``,
+            ``in_progress_jobs``, ``queued_jobs``, ``paused_auth_jobs``,
+            ``processed_tracks``, ``total_tracks``, ``matched_tracks``,
+            ``failed_tracks``, ``playlists_created`` (destination playlists
+            incl. shards), ``all_done``, ``auth_required``, ``throttle`` and
+            ``jobs`` (per-job dicts: ``job_id``, ``playlist_name``, ``status``,
+            ``processed_tracks``, ``total_tracks``, ``matched_tracks``,
+            ``failed_tracks``, ``youtube_playlist_ids``, ``error_message``).
+        """
+        jobs: List[Dict[str, Any]] = []
+        for job_id in job_ids or []:
+            try:
+                row = self.background_worker.get_job_status(job_id)
+            except ValueError:
+                logger.warning(f"Batch progress: job {job_id} not found, skipping")
+                continue
+            except Exception as e:
+                logger.error(f"Batch progress: could not read job {job_id}: {str(e)}")
+                continue
+            jobs.append({
+                'job_id': job_id,
+                'playlist_name': row.get('playlist_name') or '',
+                'status': row.get('status') or 'unknown',
+                'processed_tracks': int(row.get('progress') or 0),
+                'total_tracks': int(row.get('total') or 0),
+                'matched_tracks': int(row.get('matched_tracks') or 0),
+                'failed_tracks': int(row.get('failed_tracks') or 0),
+                'youtube_playlist_ids': list(row.get('youtube_playlist_ids') or []),
+                'error_message': row.get('error_message'),
+            })
+
+        def count(status: str) -> int:
+            return sum(1 for j in jobs if j['status'] == status)
+
+        completed = count('completed')
+        failed = count('failed')
+        terminal = completed + failed
+        all_done = len(jobs) > 0 and terminal == len(jobs)
+        paused_auth = count(self.PAUSED_AUTH_STATUS)
+
+        return {
+            'total_jobs': len(jobs),
+            'completed_jobs': completed,
+            'failed_jobs': failed,
+            'in_progress_jobs': count('in_progress'),
+            'queued_jobs': count('queued'),
+            'paused_auth_jobs': paused_auth,
+            # A completed job's processed count equals its total; a failed job
+            # keeps whatever it reached. Both count towards "done" for the bar.
+            'processed_tracks': sum(
+                j['total_tracks'] if j['status'] == 'completed' else j['processed_tracks']
+                for j in jobs
+            ),
+            'total_tracks': sum(j['total_tracks'] for j in jobs),
+            'matched_tracks': sum(j['matched_tracks'] for j in jobs),
+            'failed_tracks': sum(j['failed_tracks'] for j in jobs),
+            'playlists_created': sum(len(j['youtube_playlist_ids']) for j in jobs),
+            'all_done': all_done,
+            'auth_required': paused_auth > 0,
+            'throttle': self.get_throttle_state(),
+            'jobs': jobs,
+        }
+
     def reauthenticate_youtube(self, new_client: YTMusic) -> List[str]:
         """Swap in a refreshed YouTube Music client and resume auth-paused jobs.
 
