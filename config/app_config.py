@@ -91,32 +91,36 @@ CAPTION_SIZE = 14
 # ============================================================================
 # API Credentials
 # ============================================================================
-# NOTE: These should be loaded from environment variables or a secure config file.
-# Users must provide their own API credentials from:
-# - Spotify: https://developer.spotify.com/dashboard
-# - YouTube: https://console.cloud.google.com/
+# The ONLY required credential is the user's own Spotify Client ID
+# (docs/CONTEXT_CONTRACT.md §4.2: BYO Client ID + Authorization Code with PKCE).
+# PKCE is a public-client flow, so no Spotify client secret is needed.
+# YouTube Music is authenticated with captured browser cookies; Google OAuth
+# credentials are NOT required and cannot work against YT Music (HANDOFF.md).
 
 SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID", "")
 """Spotify API client ID. Set via SPOTIFY_CLIENT_ID environment variable."""
 
 SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
-"""Spotify API client secret. Set via SPOTIFY_CLIENT_SECRET environment variable."""
+"""Deprecated and unused: PKCE never sends a client secret. Kept only so an
+old .env does not break anything."""
 
-SPOTIFY_REDIRECT_URI = os.environ.get("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback")
-"""Spotify OAuth redirect URI. Defaults to 127.0.0.1:8888/callback.
-Note: As of Nov 2025, 'localhost' is forbidden - use loopback IP (127.0.0.1 or [::1])."""
+SPOTIFY_REDIRECT_URI = os.environ.get("SPOTIFY_REDIRECT_URI", "http://127.0.0.1/callback")
+"""Spotify OAuth redirect URI as registered in the Spotify dashboard.
 
-# YouTube OAuth Configuration
-# Note: YouTube Music uses device code flow (TV/Limited Input devices)
-# No redirect URI needed - authentication happens via device code on Google's page
+Defaults to the PORT-LESS loopback URI ``http://127.0.0.1/callback``. Spotify's
+loopback rule lets the app bind any free port at runtime and redirect to
+``http://127.0.0.1:<port>/callback``, so a port mismatch is impossible
+(CONTEXT_CONTRACT.md §4.2). 'localhost' is forbidden by Spotify (Nov 2025)."""
+
+# YouTube / Google OAuth is a settled dead end (HANDOFF.md): YouTube Music's
+# internal API rejects tokens from custom Google Cloud clients. These two values
+# are optional leftovers; nothing requires them (CONTEXT_CONTRACT.md §4.2).
 
 YOUTUBE_CLIENT_ID = os.environ.get("YOUTUBE_CLIENT_ID", "")
-"""YouTube API client ID. 
-IMPORTANT: Must be created with type 'TVs and Limited Input devices' in Google Cloud Console.
-Desktop app type will NOT work with ytmusicapi as of Nov 2024."""
+"""Optional, unused: Google OAuth cannot authenticate against YouTube Music."""
 
 YOUTUBE_CLIENT_SECRET = os.environ.get("YOUTUBE_CLIENT_SECRET", "")
-"""YouTube API client secret. Set via YOUTUBE_CLIENT_SECRET environment variable."""
+"""Optional, unused: Google OAuth cannot authenticate against YouTube Music."""
 
 
 # ============================================================================
@@ -241,42 +245,32 @@ def ensure_app_directories() -> None:
 
 def validate_credentials() -> dict:
     """Validate that required API credentials are set.
-    
-    IMPORTANT: YouTube credentials must be from OAuth Client ID type 
-    'TVs and Limited Input devices' (NOT 'Desktop app') as of Nov 2024.
-    
+
+    Per docs/CONTEXT_CONTRACT.md §4.2 the only required credential is the
+    Spotify Client ID (PKCE needs no secret). YouTube Music uses browser-cookie
+    auth and needs no client credentials at all, so ``youtube_valid`` is always
+    True and never blocks launch.
+
     Returns:
         dict: Validation result with keys:
-            - 'spotify_valid' (bool): Whether Spotify credentials are set
-            - 'youtube_valid' (bool): Whether YouTube credentials are set
-            - 'all_valid' (bool): Whether all credentials are set
+            - 'spotify_valid' (bool): Whether the Spotify Client ID is set
+            - 'youtube_valid' (bool): Always True (no credentials required)
+            - 'all_valid' (bool): Whether everything required is set
             - 'missing' (list): List of missing credential names
-    
+
     Example:
         >>> result = validate_credentials()
         >>> if not result['all_valid']:
         ...     print(f"Missing: {', '.join(result['missing'])}")
     """
     missing = []
-    
-    # Check Spotify credentials
+
     if not SPOTIFY_CLIENT_ID:
         missing.append("SPOTIFY_CLIENT_ID")
-    if not SPOTIFY_CLIENT_SECRET:
-        missing.append("SPOTIFY_CLIENT_SECRET")
-    
-    # Check YouTube credentials
-    if not YOUTUBE_CLIENT_ID:
-        missing.append("YOUTUBE_CLIENT_ID")
-    if not YOUTUBE_CLIENT_SECRET:
-        missing.append("YOUTUBE_CLIENT_SECRET")
-    
-    spotify_valid = SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET
-    youtube_valid = YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET
-    
+
     return {
-        'spotify_valid': bool(spotify_valid),
-        'youtube_valid': bool(youtube_valid),
+        'spotify_valid': bool(SPOTIFY_CLIENT_ID),
+        'youtube_valid': True,
         'all_valid': len(missing) == 0,
         'missing': missing
     }

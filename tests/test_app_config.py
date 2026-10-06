@@ -118,9 +118,17 @@ def test_api_credentials_from_env():
 
 
 def test_spotify_redirect_uri_default():
-    """Test Spotify redirect URI has default value (127.0.0.1, not localhost)."""
-    # Changed from localhost to 127.0.0.1 per Spotify Nov 2025 requirements
-    assert app_config.SPOTIFY_REDIRECT_URI == "http://127.0.0.1:8888/callback"
+    """Default redirect URI is the PORT-LESS loopback IP (CONTEXT_CONTRACT §4.2).
+
+    The port is bound dynamically at auth time; 'localhost' is forbidden by
+    Spotify since Nov 2025.
+    """
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("SPOTIFY_REDIRECT_URI", None)
+        import importlib
+        importlib.reload(app_config)
+        assert app_config.SPOTIFY_REDIRECT_URI == "http://127.0.0.1/callback"
+    assert "localhost" not in app_config.SPOTIFY_REDIRECT_URI
 
 
 # ============================================================================
@@ -175,15 +183,19 @@ def test_ensure_app_directories_already_exists():
 # Test: validate_credentials
 # ============================================================================
 
-def test_validate_credentials_all_set():
-    """Test validate_credentials with all credentials set."""
+# CONTEXT_CONTRACT §4.2: the only required credential is the Spotify Client ID.
+# PKCE needs no Spotify secret; browser-cookie YouTube auth needs no Google
+# client at all (and Google OAuth cannot work against YT Music anyway).
+
+def test_validate_credentials_only_spotify_client_id_needed():
+    """A Spotify Client ID alone is a fully valid configuration."""
     with patch.object(app_config, 'SPOTIFY_CLIENT_ID', 'spotify_id'), \
-         patch.object(app_config, 'SPOTIFY_CLIENT_SECRET', 'spotify_secret'), \
-         patch.object(app_config, 'YOUTUBE_CLIENT_ID', 'youtube_id'), \
-         patch.object(app_config, 'YOUTUBE_CLIENT_SECRET', 'youtube_secret'):
-        
+         patch.object(app_config, 'SPOTIFY_CLIENT_SECRET', ''), \
+         patch.object(app_config, 'YOUTUBE_CLIENT_ID', ''), \
+         patch.object(app_config, 'YOUTUBE_CLIENT_SECRET', ''):
+
         result = app_config.validate_credentials()
-        
+
         assert result['spotify_valid'] is True
         assert result['youtube_valid'] is True
         assert result['all_valid'] is True
@@ -191,50 +203,33 @@ def test_validate_credentials_all_set():
 
 
 def test_validate_credentials_spotify_missing():
-    """Test validate_credentials with Spotify credentials missing."""
+    """Only the Spotify Client ID is ever reported missing."""
     with patch.object(app_config, 'SPOTIFY_CLIENT_ID', ''), \
          patch.object(app_config, 'SPOTIFY_CLIENT_SECRET', ''), \
-         patch.object(app_config, 'YOUTUBE_CLIENT_ID', 'youtube_id'), \
-         patch.object(app_config, 'YOUTUBE_CLIENT_SECRET', 'youtube_secret'):
-        
+         patch.object(app_config, 'YOUTUBE_CLIENT_ID', ''), \
+         patch.object(app_config, 'YOUTUBE_CLIENT_SECRET', ''):
+
         result = app_config.validate_credentials()
-        
+
         assert result['spotify_valid'] is False
         assert result['youtube_valid'] is True
         assert result['all_valid'] is False
-        assert 'SPOTIFY_CLIENT_ID' in result['missing']
-        assert 'SPOTIFY_CLIENT_SECRET' in result['missing']
+        assert result['missing'] == ['SPOTIFY_CLIENT_ID']
 
 
-def test_validate_credentials_youtube_missing():
-    """Test validate_credentials with YouTube credentials missing."""
+def test_validate_credentials_youtube_creds_never_required():
+    """Missing Google/YouTube OAuth creds must not block launch."""
     with patch.object(app_config, 'SPOTIFY_CLIENT_ID', 'spotify_id'), \
-         patch.object(app_config, 'SPOTIFY_CLIENT_SECRET', 'spotify_secret'), \
          patch.object(app_config, 'YOUTUBE_CLIENT_ID', ''), \
          patch.object(app_config, 'YOUTUBE_CLIENT_SECRET', ''):
-        
-        result = app_config.validate_credentials()
-        
-        assert result['spotify_valid'] is True
-        assert result['youtube_valid'] is False
-        assert result['all_valid'] is False
-        assert 'YOUTUBE_CLIENT_ID' in result['missing']
-        assert 'YOUTUBE_CLIENT_SECRET' in result['missing']
 
-
-def test_validate_credentials_all_missing():
-    """Test validate_credentials with all credentials missing."""
-    with patch.object(app_config, 'SPOTIFY_CLIENT_ID', ''), \
-         patch.object(app_config, 'SPOTIFY_CLIENT_SECRET', ''), \
-         patch.object(app_config, 'YOUTUBE_CLIENT_ID', ''), \
-         patch.object(app_config, 'YOUTUBE_CLIENT_SECRET', ''):
-        
         result = app_config.validate_credentials()
-        
-        assert result['spotify_valid'] is False
-        assert result['youtube_valid'] is False
-        assert result['all_valid'] is False
-        assert len(result['missing']) == 4
+
+        assert result['youtube_valid'] is True
+        assert result['all_valid'] is True
+        assert 'YOUTUBE_CLIENT_ID' not in result['missing']
+        assert 'YOUTUBE_CLIENT_SECRET' not in result['missing']
+        assert 'SPOTIFY_CLIENT_SECRET' not in result['missing']
 
 
 # ============================================================================

@@ -149,7 +149,7 @@ def test_spotify_auth_new_user(temp_dir, mock_spotify_credentials, mock_spotify_
     auth.cache_path = cache_path
     
     # Mock the OAuth flow
-    with patch('src.auth.spotify_auth.SpotifyOAuth') as mock_oauth:
+    with patch('src.auth.spotify_auth.SpotifyPKCE') as mock_oauth:
         # Mock OAuth manager
         mock_oauth_instance = MagicMock()
         mock_oauth.return_value = mock_oauth_instance
@@ -198,7 +198,7 @@ def test_spotify_auth_cached_token(temp_dir, mock_spotify_credentials, mock_spot
     auth.cache_path = cache_path
     
     # Mock OAuth to return cached token
-    with patch('src.auth.spotify_auth.SpotifyOAuth') as mock_oauth:
+    with patch('src.auth.spotify_auth.SpotifyPKCE') as mock_oauth:
         mock_oauth_instance = MagicMock()
         mock_oauth.return_value = mock_oauth_instance
         
@@ -393,27 +393,229 @@ def test_token_manager_initialization(mock_spotify_credentials, mock_youtube_cre
 
 
 def test_token_manager_invalid_credentials():
-    """Test TokenManager with invalid credentials.
-    
-    This test validates that:
-    1. TokenManager raises ValueError for empty credentials
-    2. Proper error messages are provided
+    """TokenManager requires exactly one credential: the Spotify Client ID.
+
+    CONTEXT_CONTRACT.md §4.2: Spotify uses PKCE (no secret) and YouTube Music
+    uses browser cookies (no Google client at all). Only a missing Spotify
+    Client ID may raise.
     """
-    with pytest.raises(ValueError, match="All client credentials are required"):
+    with pytest.raises(ValueError, match="Spotify Client ID is required"):
         TokenManager(
             spotify_client_id="",
             spotify_client_secret="secret",
             youtube_client_id="id",
             youtube_client_secret="secret"
         )
-    
-    with pytest.raises(ValueError, match="All client credentials are required"):
-        TokenManager(
-            spotify_client_id="id",
-            spotify_client_secret="secret",
-            youtube_client_id="id",
-            youtube_client_secret=""
-        )
+
+    with pytest.raises(ValueError, match="Spotify Client ID is required"):
+        TokenManager(spotify_client_id="   ")
+
+
+# ============================================================================
+# CONTEXT_CONTRACT §4.2: PKCE, no secrets, port-less loopback redirect
+# ============================================================================
+
+def _manager_without_google_creds(temp_dir):
+    with patch('src.auth.token_manager.ensure_master_key', return_value=generate_key()):
+        with patch.object(TokenManager, 'TOKENS_DIR', temp_dir):
+            return TokenManager(spotify_client_id="0123456789abcdef0123456789abcdef")
+
+
+def test_token_manager_needs_no_youtube_or_spotify_secret(temp_dir):
+    """A non-technical user has no Google Cloud project and no Spotify secret."""
+    manager = _manager_without_google_creds(temp_dir)
+
+    assert manager.spotify_auth.client_id == "0123456789abcdef0123456789abcdef"
+    assert manager.spotify_auth.client_secret is None
+    assert manager.youtube_auth.client_id is None
+    assert manager.youtube_auth.client_secret is None
+
+
+def test_token_manager_treats_empty_youtube_creds_as_absent(temp_dir):
+    """Empty env strings (the .env default) must behave like 'not provided'."""
+    with patch('src.auth.token_manager.ensure_master_key', return_value=generate_key()):
+        with patch.object(TokenManager, 'TOKENS_DIR', temp_dir):
+            manager = TokenManager(
+                spotify_client_id="id",
+                spotify_client_secret="",
+                youtube_client_id="",
+                youtube_client_secret="",
+            )
+    assert manager.youtube_auth.client_id is None
+    assert manager.youtube_auth.client_secret is None
+
+
+def test_token_manager_authenticates_youtube_from_cookies_without_google_creds(temp_dir, tmp_path):
+    """Browser-cookie YouTube auth works with no YOUTUBE_CLIENT_ID/SECRET at all,
+    and the captured headers still go through the encrypted-at-rest path."""
+    manager = _manager_without_google_creds(temp_dir)
+
+    headers = tmp_path / "headers.json"
+    headers.write_text('{"cookie": "x", "authorization": "SAPISIDHASH y"}', encoding="utf-8")
+    manager.youtube_auth.browser_headers_path = headers
+    # Point the "credentials file" the manager encrypts at a real temp file.
+    creds = tmp_path / "youtube_oauth.json"
+    creds.write_text('{"cookie": "x"}', encoding="utf-8")
+    manager.youtube_auth.credentials_path = creds
+
+    signed_in = MagicMock()
+    signed_in.get_account_info.return_value = {"accountName": "Tester"}
+    with patch("src.auth.youtube_auth.YTMusic", return_value=signed_in):
+        client = manager.authenticate_youtube()
+
+    assert client is signed_in
+    assert os.path.exists(manager._get_encrypted_path(TokenManager.YOUTUBE_CACHE_NAME))
+    assert not creds.exists()  # plaintext removed after encryption
+
+
+def test_token_manager_without_google_creds_still_refuses_oauth(temp_dir, tmp_path):
+    """Dropping the requirement must not revive the dead OAuth path."""
+    manager = _manager_without_google_creds(temp_dir)
+    manager.youtube_auth.browser_headers_path = tmp_path / "absent.json"
+    manager.youtube_auth.browser_alt_path = tmp_path / "also-absent.json"
+
+    with pytest.raises(RuntimeError, match="(?i)browser"):
+        manager.authenticate_youtube()
+
+
+def test_youtube_oauth_method_always_raises_explanation():
+    """_authenticate_oauth() is a settled dead end and must keep raising."""
+    auth = YouTubeAuthenticator(client_id="cid", client_secret="secret")
+    with pytest.raises(RuntimeError, match="(?i)OAuth cannot authenticate"):
+        auth._authenticate_oauth()
+
+
+def test_spotify_authenticator_requires_only_client_id():
+    auth = SpotifyAuthenticator(client_id="abc")
+    assert auth.client_id == "abc"
+    assert auth.client_secret is None
+
+    auth_empty_secret = SpotifyAuthenticator(client_id="abc", client_secret="")
+    assert auth_empty_secret.client_secret == ""
+
+    with pytest.raises(ValueError, match="Client ID"):
+        SpotifyAuthenticator(client_id="")
+    with pytest.raises(ValueError, match="Client ID"):
+        SpotifyAuthenticator(client_id=None)
+
+
+def test_spotify_authenticator_strips_pasted_client_id():
+    """The wizard will hand over whatever the user pasted; whitespace is noise."""
+    auth = SpotifyAuthenticator(client_id="  abc123  ")
+    assert auth.client_id == "abc123"
+
+
+def test_spotify_default_redirect_uri_is_portless_loopback():
+    auth = SpotifyAuthenticator(client_id="abc")
+    assert auth.registered_redirect_uri == "http://127.0.0.1/callback"
+    assert "localhost" not in auth.registered_redirect_uri
+    assert SpotifyAuthenticator.DEFAULT_REDIRECT_URI == "http://127.0.0.1/callback"
+
+
+def test_spotify_pkce_constructed_with_client_id_and_no_secret(temp_dir):
+    """The auth manager is SpotifyPKCE, given a client id, scopes, the cache
+    path and a concrete loopback redirect with a dynamically bound port."""
+    auth = SpotifyAuthenticator(client_id="abc")
+    auth.cache_path = os.path.join(temp_dir, ".spotify_cache")
+
+    with patch('src.auth.spotify_auth.SpotifyPKCE') as mock_pkce, \
+         patch('src.auth.spotify_auth.find_free_loopback_port', return_value=43210):
+        manager = auth._get_oauth_manager()
+
+    assert manager is mock_pkce.return_value
+    mock_pkce.assert_called_once()
+    kwargs = mock_pkce.call_args.kwargs
+    assert kwargs["client_id"] == "abc"
+    assert "client_secret" not in kwargs
+    assert kwargs["redirect_uri"] == "http://127.0.0.1:43210/callback"
+    assert kwargs["scope"] == SpotifyAuthenticator.REQUIRED_SCOPES
+    assert kwargs["cache_path"] == auth.cache_path
+    assert kwargs["open_browser"] is True
+    assert auth.redirect_uri == "http://127.0.0.1:43210/callback"
+
+
+def test_spotify_pkce_scopes_unchanged():
+    scopes = set(SpotifyAuthenticator.REQUIRED_SCOPES.split(","))
+    assert scopes == {"playlist-read-private", "playlist-read-collaborative", "user-library-read"}
+
+
+def test_spotify_redirect_port_falls_back_when_binding_fails():
+    from src.auth.spotify_auth import resolve_redirect_uri, FALLBACK_REDIRECT_PORT
+
+    with patch('src.auth.spotify_auth.find_free_loopback_port', side_effect=OSError("no ports")):
+        uri = resolve_redirect_uri("http://127.0.0.1/callback")
+
+    assert uri == f"http://127.0.0.1:{FALLBACK_REDIRECT_PORT}/callback"
+
+
+def test_spotify_redirect_with_explicit_port_is_left_alone():
+    from src.auth.spotify_auth import resolve_redirect_uri
+
+    with patch('src.auth.spotify_auth.find_free_loopback_port') as binder:
+        uri = resolve_redirect_uri("http://127.0.0.1:9999/callback")
+
+    assert uri == "http://127.0.0.1:9999/callback"
+    binder.assert_not_called()
+
+
+def test_find_free_loopback_port_binds_127_0_0_1():
+    """The dynamic port comes from binding 127.0.0.1:0, never localhost."""
+    from src.auth.spotify_auth import find_free_loopback_port
+    import socket as real_socket
+
+    with patch('src.auth.spotify_auth.socket.socket') as mock_socket_cls:
+        sock = mock_socket_cls.return_value.__enter__.return_value
+        sock.getsockname.return_value = ("127.0.0.1", 50505)
+
+        assert find_free_loopback_port() == 50505
+        sock.bind.assert_called_once_with(("127.0.0.1", 0))
+
+
+def test_spotify_authenticate_with_only_client_id_runs_pkce_flow(temp_dir, mock_spotify_token):
+    """End to end (mocked): client id only -> PKCE -> token -> client."""
+    auth = SpotifyAuthenticator(client_id="abc")
+    auth.cache_path = os.path.join(temp_dir, ".spotify_cache")
+
+    with patch('src.auth.spotify_auth.SpotifyPKCE') as mock_pkce, \
+         patch('src.auth.spotify_auth.find_free_loopback_port', return_value=43210), \
+         patch('src.auth.spotify_auth.spotipy.Spotify') as mock_spotify:
+        pkce = mock_pkce.return_value
+        pkce.get_cached_token.return_value = None
+        pkce.get_access_token.return_value = mock_spotify_token
+        mock_spotify.return_value.current_user.return_value = {"id": "u"}
+
+        client = auth.authenticate()
+
+    assert client is mock_spotify.return_value
+    pkce.get_access_token.assert_called_once_with()
+    mock_spotify.assert_called_once_with(auth_manager=pkce)
+
+
+def test_token_manager_spotify_cache_still_encrypted_at_rest(temp_dir, mock_spotify_token):
+    """After a PKCE login the plaintext cache is encrypted into TOKENS_DIR."""
+    manager = _manager_without_google_creds(temp_dir)
+    cache_path = os.path.join(temp_dir, ".spotify_cache_plain")
+    manager.spotify_auth.cache_path = cache_path
+    with open(cache_path, "w") as f:
+        json.dump(mock_spotify_token, f)
+
+    with patch.object(manager.spotify_auth, 'authenticate', return_value=MagicMock()):
+        manager.authenticate_spotify()
+
+    assert not os.path.exists(cache_path)
+    enc_path = manager._get_encrypted_path(TokenManager.SPOTIFY_CACHE_NAME)
+    assert os.path.exists(enc_path)
+    assert decrypt_json_file(enc_path, manager.encryption_key) == mock_spotify_token
+
+
+def test_token_manager_passes_registered_redirect_uri_through(temp_dir):
+    with patch('src.auth.token_manager.ensure_master_key', return_value=generate_key()):
+        with patch.object(TokenManager, 'TOKENS_DIR', temp_dir):
+            manager = TokenManager(
+                spotify_client_id="id",
+                spotify_redirect_uri="http://127.0.0.1/callback",
+            )
+    assert manager.spotify_auth.registered_redirect_uri == "http://127.0.0.1/callback"
 
 
 # ---------------------------------------------------------------------------

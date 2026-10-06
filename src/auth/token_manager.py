@@ -54,41 +54,52 @@ class TokenManager:
     def __init__(
         self,
         spotify_client_id: str,
-        spotify_client_secret: str,
-        youtube_client_id: str,
-        youtube_client_secret: str
+        spotify_client_secret: Optional[str] = None,
+        youtube_client_id: Optional[str] = None,
+        youtube_client_secret: Optional[str] = None,
+        spotify_redirect_uri: Optional[str] = None,
     ):
         """Initialize the Token Manager with client credentials.
-        
+
         Sets up authenticators for both services and ensures the encryption
         infrastructure is in place.
-        
+
+        The only required credential is the Spotify Client ID
+        (CONTEXT_CONTRACT.md §4.2: BYO Client ID + PKCE, no secret). The
+        YouTube/Google client id and secret are accepted for backward
+        compatibility but are NOT required: YouTube Music is authenticated with
+        captured browser cookies, and Google OAuth cannot work against it at
+        all (see YouTubeAuthenticator._authenticate_oauth). Demanding them only
+        blocked users who have no reason to own Google Cloud credentials.
+
         Args:
             spotify_client_id (str): Spotify application client ID.
-            spotify_client_secret (str): Spotify application client secret.
-            youtube_client_id (str): Google OAuth client ID for YouTube.
-            youtube_client_secret (str): Google OAuth client secret for YouTube.
-            
+            spotify_client_secret (Optional[str]): Ignored (PKCE uses no secret).
+            youtube_client_id (Optional[str]): Ignored unless the dead OAuth path
+                is ever revived; browser-cookie auth needs no client.
+            youtube_client_secret (Optional[str]): Same as above.
+            spotify_redirect_uri (Optional[str]): Registered Spotify redirect
+                URI; defaults to the port-less ``http://127.0.0.1/callback``.
+
         Raises:
-            ValueError: If any credentials are empty or None.
+            ValueError: If the Spotify Client ID is empty or None.
             OSError: If token directory cannot be created.
         """
-        # Validate inputs
-        if not all([spotify_client_id, spotify_client_secret, 
-                   youtube_client_id, youtube_client_secret]):
-            raise ValueError("All client credentials are required")
-        
+        if not spotify_client_id or not str(spotify_client_id).strip():
+            raise ValueError("Spotify Client ID is required")
+
         logger.info("Initializing TokenManager")
-        
+
         # Initialize authenticators
         self.spotify_auth = SpotifyAuthenticator(
             client_id=spotify_client_id,
-            client_secret=spotify_client_secret
+            client_secret=spotify_client_secret,
+            redirect_uri=spotify_redirect_uri,
         )
-        
+
         self.youtube_auth = YouTubeAuthenticator(
-            client_id=youtube_client_id,
-            client_secret=youtube_client_secret
+            client_id=youtube_client_id or None,
+            client_secret=youtube_client_secret or None
         )
         
         # Ensure tokens directory exists
@@ -287,10 +298,13 @@ class TokenManager:
             temp_cache = self._decrypt_to_temp(self.SPOTIFY_CACHE_NAME)
             
             try:
-                # Update the authenticator's cache path to use decrypted file
+                # Update the authenticator's cache path to use decrypted file.
+                # Drop any previously built auth manager so the new path (and a
+                # freshly resolved loopback port) is actually picked up.
                 original_cache_path = self.spotify_auth.cache_path
                 self.spotify_auth.cache_path = temp_cache
-                
+                self.spotify_auth._sp_oauth = None
+
                 # Create authenticated client
                 sp_client = spotipy.Spotify(auth_manager=self.spotify_auth._get_oauth_manager())
                 
