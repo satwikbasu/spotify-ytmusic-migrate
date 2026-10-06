@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+> **Continuing earlier work?** Read `HANDOFF.md` first — it captures the live-testing
+> findings, the auth reality, the extension/bridge prototype, and the dead ends that the
+> stale root `*_OAUTH_*` / `BROWSER_AUTH_*` notes get wrong.
+
 ## What this is
 
 A local desktop app (Python + Flet) that migrates Spotify playlists to YouTube Music. Design goals from `spec.md`: survive bulk migrations (50k+ tracks) without hitting rate limits or getting accounts banned, run entirely on the user's machine, and resume interrupted work.
