@@ -5,6 +5,21 @@ architecture sessions, so a fresh Claude Code session (e.g. in the cloud) has
 accurate context. It supersedes the stale `*_OAUTH_*` / `BROWSER_AUTH_*` /
 `ACTION_REQUIRED` notes, several of which describe approaches since proven dead.
 
+## Working model (cloud + local split)
+
+The owner develops across two environments, deliberately:
+
+- **Cloud (Claude Code):** write code, run the unit suite, do design/spec work.
+  No credentials needed, and no browser — so live Spotify OAuth and the YT Music
+  extension capture cannot run here. Push changes to the remote when done.
+- **Local (the owner's machine):** manual / live testing. The owner does a
+  `git pull` of the updated branch, then runs whatever is needed locally — the
+  real Spotify login, the browser + extension capture, and full live
+  migrations. This is the only place end-to-end testing actually works.
+
+So: cloud writes and unit-tests the code; local pulls and runs it for real.
+Keep changes pushed so the local pull is always current.
+
 ## Current state
 
 - Engine is solid. Suite: **691 passing / 1 failing** (the 1 is a deliberate
