@@ -26,6 +26,7 @@ Example:
 """
 
 import flet as ft
+import logging
 import time
 import threading
 from typing import Optional, Dict, Any, List
@@ -35,6 +36,8 @@ from src.ui.base_screen import BaseScreen
 from src.ui.components import AppButton, ProgressBar, StatusBanner
 from src.migrators.migration_manager import MigrationManager
 from config import app_config
+
+logger = logging.getLogger(__name__)
 
 
 class MigrationProgressScreen(BaseScreen):
@@ -136,6 +139,9 @@ class MigrationProgressScreen(BaseScreen):
         self.wait_banner_holder: Optional[ft.Container] = None
         self.wait_banner_kind: Optional[str] = None
         self.wait_banner_text: str = ""
+        self.reconnect_button: Optional[ft.TextButton] = None
+        self.reconnect_row: Optional[ft.Row] = None
+        self.reconnect_status: Optional[ft.Text] = None
 
     def build(self) -> ft.Control:
         """Build the migration progress screen UI.
@@ -220,6 +226,15 @@ class MigrationProgressScreen(BaseScreen):
 
         # "Why are we waiting" banner: hidden until auth/throttle says so
         self.wait_banner_holder = ft.Container(content=None, visible=False, width=600)
+        # Manual Reconnect for the auth banner (shown only while auth is needed)
+        self.reconnect_button = ft.TextButton(
+            text="Reconnect YouTube Music", on_click=self._on_reconnect_click
+        )
+        self.reconnect_status = ft.Text(value="", size=app_config.CAPTION_SIZE)
+        self.reconnect_row = ft.Row(
+            controls=[self.reconnect_button, self.reconnect_status],
+            visible=False, width=600,
+        )
 
         # Tip banner (with width constraint)
         tip_banner = ft.Container(
@@ -272,6 +287,7 @@ class MigrationProgressScreen(BaseScreen):
                 self.time_text,
                 ft.Container(height=20),
                 self.wait_banner_holder,
+                self.reconnect_row,
                 ft.Container(height=10),
                 tip_banner,
                 ft.Container(height=20),
@@ -349,6 +365,14 @@ class MigrationProgressScreen(BaseScreen):
             # a migration is active. Without this, close-with-job and
             # sleep-inhibition stay inert. See CONTEXT_CONTRACT §4.3.
             self.app_state['migration_manager'] = self.migration_manager
+
+            # Wire auth-pause -> silent re-capture through the extension bridge.
+            hub = self.app_state.get('capture_hub')
+            if hub is not None:
+                try:
+                    hub.attach_engine(self.migration_manager)
+                except Exception as e:
+                    logger.warning(f"Could not attach capture hub: {e}")
 
             # Start background worker
             self.migration_manager.start()
@@ -515,6 +539,8 @@ class MigrationProgressScreen(BaseScreen):
         self.wait_banner_text = text
         if not self.wait_banner_holder:
             return
+        if self.reconnect_row is not None:
+            self.reconnect_row.visible = (kind == 'auth')
         if kind is None:
             self.wait_banner_holder.content = None
             self.wait_banner_holder.visible = False
@@ -524,6 +550,55 @@ class MigrationProgressScreen(BaseScreen):
                 banner_type="error" if kind == 'auth' else "warning"
             )
             self.wait_banner_holder.visible = True
+
+    def _on_reconnect_click(self, e=None) -> None:
+        """Manual Reconnect on the auth banner: ask the extension for a fresh sign-in."""
+        hub = self.app_state.get('capture_hub')
+        if hub is None:
+            self._set_reconnect_status(
+                "The connection helper isn't running. Please restart the app.")
+            return
+        self._set_reconnect_status("Reconnecting...")
+        if self.reconnect_button is not None:
+            self.reconnect_button.disabled = True
+
+        def work():
+            try:
+                res = hub.request_capture("reauth")
+            except Exception as ex:
+                logger.error(f"Reconnect failed: {type(ex).__name__}")
+                res = None
+            self._on_reconnect_result(res)
+
+        threading.Thread(target=work, name="yt-reconnect", daemon=True).start()
+
+    RECONNECT_MESSAGES = {
+        "no_extension": "We can't see the browser extension. Open your browser, then try again.",
+        "signed_out": "You're not signed in to YouTube Music in your browser. Sign in there, then try again.",
+        "network": "We couldn't reach YouTube Music. Check your internet and try again.",
+        "rate_limited": "YouTube Music asked us to slow down. Wait a minute, then try again.",
+    }
+
+    def _on_reconnect_result(self, res) -> None:
+        if self.reconnect_button is not None:
+            self.reconnect_button.disabled = False
+        if res is not None and getattr(res, "ok", False):
+            self.app_state['youtube_client'] = res.client
+            self._set_reconnect_status("Reconnected.")
+            # The engine swaps the client and re-queues parked jobs; the next
+            # poll clears the banner once auth_required is no longer set.
+        else:
+            code = getattr(res, "code", None)
+            self._set_reconnect_status(self.RECONNECT_MESSAGES.get(
+                code, "We couldn't reconnect. Make sure you're signed in to YouTube Music, then try again."))
+
+    def _set_reconnect_status(self, text: str) -> None:
+        if self.reconnect_status is not None:
+            self.reconnect_status.value = text
+        try:
+            self.page.update()
+        except Exception:
+            pass
 
     def _finish(self, batch: Optional[Dict[str, Any]]) -> None:
         """Mark the batch complete and move to Results after a short beat."""

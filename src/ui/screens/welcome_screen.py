@@ -14,6 +14,7 @@ from src.ui.components import AppButton, AppTextField
 from src.auth.token_manager import TokenManager
 from src.utils import user_config
 from config import app_config
+from src.capture.constants import CHROME_WEB_STORE_ID, EDGE_ADDONS_ID
 
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,50 @@ CLIENT_ID_INVALID_HELP = (
     "That doesn't look like a Client ID \u2014 it should be exactly 32 letters and "
     "numbers. Make sure you copied Client ID, not the app name or the secret."
 )
+
+
+# YouTube Music extension install links (ids are PLACEHOLDERS until the stores
+# list the extension; see src/capture/constants.py).
+CHROME_STORE_URL = "https://chromewebstore.google.com/detail/" + CHROME_WEB_STORE_ID
+EDGE_STORE_URL = "https://microsoftedge.microsoft.com/addons/detail/" + EDGE_ADDONS_ID
+FIREFOX_STORE_URL = "https://addons.mozilla.org/firefox/addon/playlist-migrator-capture/"  # PLACEHOLDER
+YOUTUBE_MUSIC_URL = "https://music.youtube.com"
+
+# Plain-language YouTube Music connect problems (docs/UX_FLOW.md section 7, E7-E10).
+# code (CaptureResult.code, plus "no_helper") -> (message, [remedy ids])
+YOUTUBE_ERRORS = {
+    "no_extension": (
+        "To connect YouTube Music you need our small browser extension \u2014 "
+        "a one-minute, one-click install. This page updates by itself once it's added.",
+        ["add_chrome", "add_edge", "add_firefox", "check_again"],
+    ),
+    "signed_out": (
+        "You're not signed in to YouTube Music in your browser. "
+        "Sign in there, then click Connect.",
+        ["open_youtube", "try_again_yt"],
+    ),
+    "rejected": (
+        "YouTube Music didn't accept the sign-in from your browser. "
+        "Make sure you're signed in there, then try again.",
+        ["open_youtube", "try_again_yt"],
+    ),
+    "network": (
+        "We couldn't reach YouTube Music. Check your internet connection and try again.",
+        ["try_again_yt"],
+    ),
+    "rate_limited": (
+        "YouTube Music asked us to slow down. Wait a minute, then try again.",
+        ["try_again_yt"],
+    ),
+    "timeout": (
+        "The extension can't reach this app. Restarting the app usually fixes it.",
+        ["try_again_yt"],
+    ),
+    "no_helper": (
+        "The connection helper isn't running. Please restart the app and try again.",
+        [],
+    ),
+}
 
 
 def classify_spotify_error(exc: BaseException) -> str:
@@ -162,6 +207,13 @@ class WelcomeScreen(BaseScreen):
         self.wizard_connect_button: Optional[ft.Control] = None
         self.spotify_error_text: Optional[ft.Text] = None
         self.spotify_error_row: Optional[ft.Row] = None
+
+        # YouTube Music connect state (extension bridge)
+        self.youtube_name: Optional[str] = None
+        self.youtube_error_kind: Optional[str] = None
+        self.youtube_error_text: Optional[ft.Text] = None
+        self.youtube_error_row: Optional[ft.Row] = None
+        self._yt_unsubscribe = None
         
         # UI component references (will be set in build())
         self.spotify_status_text: Optional[ft.Text] = None
@@ -355,7 +407,8 @@ class WelcomeScreen(BaseScreen):
                             ),
                             ft.Container(height=4),
                             status_text
-                        ] + (self._build_spotify_error_controls() if is_spotify else []),
+                        ] + (self._build_spotify_error_controls() if is_spotify
+                             else self._build_youtube_error_controls()),
                         spacing=0,
                         expand=True
                     ),
@@ -539,34 +592,131 @@ class WelcomeScreen(BaseScreen):
             self._start_spotify_connect()
             return
 
+        self._start_youtube_connect()
+
+    # ------------------------------------------------------------------
+    # YouTube Music: extension bridge (CaptureHub)
+    # ------------------------------------------------------------------
+
+    def _build_youtube_error_controls(self) -> list:
+        self.youtube_error_text = ft.Text(
+            value="", size=app_config.CAPTION_SIZE, color=app_config.ERROR_COLOR,
+            visible=False,
+        )
+        self.youtube_error_row = ft.Row(controls=[], wrap=True, spacing=8, visible=False)
+        return [self.youtube_error_text, self.youtube_error_row]
+
+    def _youtube_remedy_button(self, key: str) -> ft.Control:
+        labels = {
+            "add_chrome": ("Add to Chrome", lambda e=None: self._open_url(CHROME_STORE_URL)),
+            "add_edge": ("Add to Edge", lambda e=None: self._open_url(EDGE_STORE_URL)),
+            "add_firefox": ("Add to Firefox", lambda e=None: self._open_url(FIREFOX_STORE_URL)),
+            "check_again": ("Check again", self._on_youtube_try_again),
+            "open_youtube": ("Open YouTube Music", lambda e=None: self._open_url(YOUTUBE_MUSIC_URL)),
+            "try_again_yt": ("Try again", self._on_youtube_try_again),
+        }
+        text, handler = labels[key]
+        return ft.TextButton(text=text, on_click=handler)
+
+    def _set_youtube_error(self, kind: Optional[str]) -> None:
+        """Show (or clear, with None) a plain-language YouTube Music problem."""
+        self.youtube_error_kind = kind
+        if self.youtube_error_text is None:
+            return
+        if kind is None:
+            self.youtube_error_text.value = ""
+            self.youtube_error_text.visible = False
+            self.youtube_error_row.controls = []
+            self.youtube_error_row.visible = False
+        else:
+            message, remedies = YOUTUBE_ERRORS.get(kind, YOUTUBE_ERRORS["rejected"])
+            self.youtube_error_text.value = message
+            self.youtube_error_text.visible = True
+            self.youtube_error_row.controls = [self._youtube_remedy_button(k) for k in remedies]
+            self.youtube_error_row.visible = True
+        self._safe_update()
+
+    def _on_youtube_try_again(self, e=None) -> None:
+        self._set_youtube_error(None)
+        self._start_youtube_connect()
+
+    def _stop_waiting_for_extension(self) -> None:
+        unsub, self._yt_unsubscribe = self._yt_unsubscribe, None
+        if unsub is not None:
+            try:
+                unsub()
+            except Exception as ex:
+                logger.debug(f"Could not unsubscribe from capture hub: {ex}")
+
+    def _start_youtube_connect(self) -> None:
+        """Connect YouTube Music through the extension bridge (no tokens, no typing)."""
         logger.info("Attempting to connect YouTube Music")
-        if not user_config.get_spotify_client_id():
-            self.show_error(
-                "Please connect Spotify first, then connect YouTube Music.",
-                title="Connect Spotify first"
-            )
+        self._set_youtube_error(None)
+        hub = self.app_state.get('capture_hub')
+        if hub is None:
+            self._set_youtube_error("no_helper")
             return
 
+        try:
+            has_port = bool(hub.ports())
+        except Exception:
+            has_port = False
+        if not has_port:
+            # First run: show the install state and advance by itself once the
+            # extension's first hello arrives.
+            self._set_youtube_error("no_extension")
+            self._wait_for_extension(hub)
+            return
+
+        self._stop_waiting_for_extension()
         self.show_loading(True, "Connecting to YouTube Music...")
         try:
-            if not self._initialize_token_manager():
-                return
-            self.youtube_client = self.token_manager.authenticate_youtube()
-            self.youtube_authenticated = True
-            logger.info("YouTube Music authentication successful")
-            self._update_card_state(False, True)
-            self.show_success(
-                "Successfully connected to YouTube Music!", title="Connected"
-            )
+            hub.connect_youtube(self._on_youtube_result)
         except Exception as e:
-            logger.error(f"YouTube Music authentication failed: {e}")
-            self.show_error(
-                "We couldn't connect to YouTube Music. Make sure you're signed in "
-                "to YouTube Music in your browser, then try again.",
-                title="Connection Error"
-            )
-        finally:
+            logger.error(f"YouTube Music connect could not start: {type(e).__name__}")
             self.show_loading(False)
+            self._set_youtube_error("timeout")
+
+    def _wait_for_extension(self, hub) -> None:
+        if self._yt_unsubscribe is not None:
+            return
+
+        def on_event(event: str, data: dict) -> None:
+            if event == "hello" and not self.youtube_authenticated:
+                self._stop_waiting_for_extension()
+                self._set_youtube_error(None)
+                self._start_youtube_connect()
+
+        try:
+            self._yt_unsubscribe = hub.subscribe(on_event)
+        except Exception as e:
+            logger.debug(f"Could not subscribe to capture hub: {e}")
+
+    def _on_youtube_result(self, result) -> None:
+        """Called by the hub (on its own thread) with the verified capture result."""
+        self.show_loading(False)
+        if getattr(result, "ok", False):
+            self._complete_youtube(result.client, getattr(result, "account_name", "") or None)
+        else:
+            code = getattr(result, "code", None) or "rejected"
+            logger.info(f"YouTube Music connect failed: {code}")
+            self._set_youtube_error(code)
+            if code == "no_extension":
+                hub = self.app_state.get('capture_hub')
+                if hub is not None:
+                    self._wait_for_extension(hub)
+
+    def _complete_youtube(self, client, name: Optional[str]) -> None:
+        self._stop_waiting_for_extension()
+        self.youtube_client = client
+        self.youtube_authenticated = True
+        self.youtube_name = name
+        self.app_state['youtube_client'] = client
+        if self.token_manager is not None:
+            self.app_state['token_manager'] = self.token_manager
+        self._set_youtube_error(None)
+        self._update_card_state(False, True, name=name)
+        logger.info("YouTube Music connected")
 
     # ------------------------------------------------------------------
     # Spotify: authenticate + /me diagnosis
@@ -643,9 +793,13 @@ class WelcomeScreen(BaseScreen):
             if tm.is_youtube_authenticated():
                 yt = tm.get_youtube_client()
                 if yt is not None:
-                    self.youtube_client = yt
-                    self.youtube_authenticated = True
-                    self._update_card_state(False, True)
+                    name = None
+                    try:
+                        loaded = tm.youtube_session_store.load()
+                        name = (loaded[1] or None) if loaded else None
+                    except Exception:
+                        name = None
+                    self._complete_youtube(yt, name)
         except Exception as e:
             logger.warning(f"Could not restore previous session: {e}")
 
@@ -824,6 +978,13 @@ class WelcomeScreen(BaseScreen):
             else:
                 self.youtube_client = None
                 self.youtube_authenticated = False
+                self.youtube_name = None
+                self.app_state['youtube_client'] = None
+                if self.token_manager is not None:
+                    try:
+                        self.token_manager.clear_youtube_token()
+                    except Exception as ex:
+                        logger.warning(f"Could not clear YouTube session: {ex}")
             
             # Update UI
             self._update_card_state(is_spotify, False)

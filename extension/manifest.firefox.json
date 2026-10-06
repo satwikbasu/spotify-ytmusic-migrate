@@ -15,8 +15,15 @@
     "default_popup": "popup.html",
     "default_title": "Playlist Migrator"
   },
-  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtgc0kbonEWF/CFsmt5kzjG5hRqEHrxLFmaMGls52FyljW7G77FMXZLeg/0IU7lCWl0BI6W9uJtxXwpZnghJssclIR3tSUQgfGSA+GVoGFozao1+eqFaCht3qfWod9jXGhz6svASsl97Fz2mTJ/8Zyo5Fi94tmMvGiL6BA4PQJv7NHOLxdB5JTyvXa3WiVxFMFE1uhpzAx2AuaJw4QyNtTj5zyQJ9G62ftAkNqpZ5INWtHckFXRQaaGLMvvqC3eSGX4FveG8/YfEjx7Sr3CeUGMzbMnS+S/3BriqFGBztzoe7U+JnScS0A1KL6/c6Rl5o0aiEhgtkghvepnuXSVuvtwIDAQAB",
   "background": {
-    "service_worker": "background.js"
+    "scripts": [
+      "background.js"
+    ]
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "capture@playlist-migrator.app",
+      "strict_min_version": "115.0"
+    }
   }
 }

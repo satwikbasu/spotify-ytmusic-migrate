@@ -290,43 +290,33 @@ class TestWelcomeScreenSpotifyConnect:
 
 
 class TestWelcomeScreenYouTubeConnect:
-    """Test YouTube Music connection flow."""
-    
-    @patch('src.ui.screens.welcome_screen.TokenManager')
-    def test_youtube_connect_success(self, mock_token_manager_class, welcome_screen, saved_id):
-        """Test successful YouTube connection."""
+    """YouTube Music connect now goes through CaptureHub (see tests/test_youtube_connect_wiring.py)."""
+
+    def test_youtube_connect_success(self, welcome_screen):
         welcome_screen.build()
-        mock_token_manager = Mock()
-        mock_youtube_client = Mock(spec=YTMusic)
-        mock_token_manager.authenticate_youtube.return_value = mock_youtube_client
-        mock_token_manager_class.return_value = mock_token_manager
-        
-        with patch.object(app_config, 'SPOTIFY_CLIENT_ID', 'spotify_id'), \
-             patch.object(app_config, 'SPOTIFY_CLIENT_SECRET', 'spotify_secret'), \
-             patch.object(app_config, 'YOUTUBE_CLIENT_ID', 'youtube_id'), \
-             patch.object(app_config, 'YOUTUBE_CLIENT_SECRET', 'youtube_secret'):
-            
-            welcome_screen.on_youtube_connect_click(None)
-        
+        hub = Mock()
+        hub.ports.return_value = [{"port_id": "p"}]
+        yt = Mock(spec=YTMusic)
+        hub.connect_youtube.side_effect = lambda cb: cb(
+            Mock(ok=True, client=yt, account_name="Sam", code=None))
+        welcome_screen.app_state['capture_hub'] = hub
+
+        welcome_screen.on_youtube_connect_click(None)
+
         assert welcome_screen.youtube_authenticated is True
-        assert welcome_screen.youtube_client is mock_youtube_client
-        mock_token_manager.authenticate_youtube.assert_called_once()
-    
-    @patch('src.ui.screens.welcome_screen.TokenManager')
-    def test_youtube_connect_error(self, mock_token_manager_class, welcome_screen, saved_id):
-        """Test YouTube connection with error."""
+        assert welcome_screen.youtube_client is yt
+        hub.connect_youtube.assert_called_once()
+
+    def test_youtube_connect_error(self, welcome_screen):
         welcome_screen.build()
-        mock_token_manager = Mock()
-        mock_token_manager.authenticate_youtube.side_effect = RuntimeError("Auth failed")
-        mock_token_manager_class.return_value = mock_token_manager
-        
-        with patch.object(app_config, 'SPOTIFY_CLIENT_ID', 'spotify_id'), \
-             patch.object(app_config, 'SPOTIFY_CLIENT_SECRET', 'spotify_secret'), \
-             patch.object(app_config, 'YOUTUBE_CLIENT_ID', 'youtube_id'), \
-             patch.object(app_config, 'YOUTUBE_CLIENT_SECRET', 'youtube_secret'):
-            
-            welcome_screen.on_youtube_connect_click(None)
-        
+        hub = Mock()
+        hub.ports.return_value = [{"port_id": "p"}]
+        hub.connect_youtube.side_effect = lambda cb: cb(
+            Mock(ok=False, client=None, account_name="", code="signed_out"))
+        welcome_screen.app_state['capture_hub'] = hub
+
+        welcome_screen.on_youtube_connect_click(None)
+
         assert welcome_screen.youtube_authenticated is False
 
 
@@ -448,6 +438,11 @@ class TestWelcomeScreenIntegration:
         mock_token_manager.authenticate_spotify.return_value = mock_spotify_client
         mock_token_manager.authenticate_youtube.return_value = mock_youtube_client
         mock_token_manager_class.return_value = mock_token_manager
+        hub = Mock()
+        hub.ports.return_value = [{"port_id": "p"}]
+        hub.connect_youtube.side_effect = lambda cb: cb(
+            Mock(ok=True, client=mock_youtube_client, account_name="Sam", code=None))
+        welcome_screen.app_state['capture_hub'] = hub
         
         with patch.object(app_config, 'SPOTIFY_CLIENT_ID', 'spotify_id'), \
              patch.object(app_config, 'SPOTIFY_CLIENT_SECRET', 'spotify_secret'), \

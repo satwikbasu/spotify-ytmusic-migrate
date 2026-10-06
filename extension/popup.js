@@ -1,52 +1,31 @@
-const BRIDGE = "http://127.0.0.1:8765";
+// Status-only popup. No inputs: the app and extension pair automatically.
+"use strict";
+const api = globalThis.browser || globalThis.chrome;
 const statusEl = document.getElementById("status");
-const tokenEl = document.getElementById("token");
+const btn = document.getElementById("connect");
 
-// Remember the pairing token between popup opens.
-chrome.storage.local.get("token", ({ token }) => {
-  if (token) tokenEl.value = token;
-});
-
-function show(msg, cls) {
-  statusEl.textContent = msg;
-  statusEl.className = cls || "";
+function describe(s) {
+  if (s.account) return { text: "Connected to YouTube Music as " + s.account + ".", button: false };
+  if (s.state === "app_not_running") return { text: "The Playlist Migrator app isn't running. Open it, then click Connect.", button: true };
+  if (s.state === "host_unreachable") return { text: "This extension can't reach the app. Restarting the app usually fixes it.", button: true };
+  if (s.signedOut || s.failure === "signed_out") return { text: "You're not signed in to YouTube Music in this browser. Sign in at music.youtube.com, then click Connect.", button: true };
+  if (s.failure) return { text: "YouTube Music didn't accept the sign-in. Make sure you're signed in, then try again.", button: true };
+  if (s.state === "connected") return { text: "Ready. Click Connect to link YouTube Music.", button: true };
+  return { text: "Not connected.", button: true };
 }
 
-document.getElementById("connect").addEventListener("click", async () => {
-  const token = tokenEl.value.trim();
-  if (!token) return show("Enter the pairing token shown in the app window.", "err");
-  chrome.storage.local.set({ token });
+function render(s) {
+  const d = describe(s);
+  statusEl.textContent = d.text;
+  btn.hidden = !d.button;
+}
 
-  show("Reading YouTube Music session ...");
-  let cookies;
-  try {
-    // Returns httpOnly cookies too (unlike document.cookie), because the
-    // extension holds the "cookies" permission for this host.
-    cookies = await chrome.cookies.getAll({ url: "https://music.youtube.com" });
-  } catch (e) {
-    return show("Could not read cookies: " + e.message, "err");
-  }
-  if (!cookies || !cookies.some((c) => c.name === "__Secure-3PAPISID")) {
-    return show("You are not signed in to music.youtube.com in this browser.", "err");
-  }
+function refresh() { api.runtime.sendMessage({ type: "get_status" }).then(render, () => render({})); }
 
-  show("Handing session to the local app ...");
-  try {
-    const res = await fetch(BRIDGE + "/yt-session", {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-bridge-token": token },
-      body: JSON.stringify({
-        cookies: cookies.map((c) => ({ name: c.name, value: c.value })),
-      }),
-    });
-    const body = await res.json();
-    if (res.ok && body.connected) {
-      show("Connected as " + (body.account || "your account") +
-           ".\nMigration started - watch the app window.", "ok");
-    } else {
-      show("Bridge error: " + (body.error || res.status), "err");
-    }
-  } catch (e) {
-    return show("Could not reach the local app on 127.0.0.1:8765. Is it running?", "err");
-  }
+btn.addEventListener("click", () => {
+  btn.disabled = true;
+  statusEl.textContent = "Connecting...";
+  api.runtime.sendMessage({ type: "connect" }).then(() => setTimeout(() => { btn.disabled = false; refresh(); }, 1500),
+    () => { btn.disabled = false; refresh(); });
 });
+refresh();
