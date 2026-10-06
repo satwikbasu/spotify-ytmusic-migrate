@@ -10,8 +10,9 @@ from collections import Counter
 from typing import List, Dict, Optional, Callable, Any, Generator
 
 from ytmusicapi import YTMusic
-from ytmusicapi.exceptions import YTMusicServerError
+from ytmusicapi.exceptions import YTMusicServerError, YTMusicUserError
 
+from src.utils.errors import YouTubeAuthError, is_auth_error
 from src.searchers.youtube_searcher import YouTubeSearcher
 from src.matchers.track_matcher import TrackMatcher
 from src.utils.cache_manager import CacheManager
@@ -94,9 +95,29 @@ class PlaylistMigrator:
         self.track_matcher = track_matcher
         self.cache_manager = cache_manager
         self.rate_limiter = rate_limiter
-        
+
         logger.info("PlaylistMigrator initialized")
-    
+
+    def set_client(self, ytmusic_client: YTMusic) -> None:
+        """Swap in a refreshed ytmusicapi client (and hand it to the searcher).
+
+        Client-swap seam for the auth-failure flow (contract §4.3): after a
+        ``YouTubeAuthError`` paused the job, the §4.1 extension re-capture
+        yields a fresh client and ``MigrationManager.reauthenticate_youtube()``
+        calls this before the paused job is re-queued. The migrator itself is
+        not rebuilt, so cache, matcher and rate limiter are untouched.
+
+        Raises:
+            ValueError: If ytmusic_client is None
+        """
+        if ytmusic_client is None:
+            raise ValueError("ytmusic_client cannot be None")
+        self.ytmusic_client = ytmusic_client
+        setter = getattr(self.youtube_searcher, 'set_client', None)
+        if callable(setter):
+            setter(ytmusic_client)
+        logger.info("PlaylistMigrator client replaced")
+
     def migrate_playlist(
         self,
         playlist_name: str,
@@ -161,6 +182,10 @@ class PlaylistMigrator:
         Raises:
             ValueError: If playlist_name is empty or tracks list is empty
             RuntimeError: If the destination playlist cannot be created
+            YouTubeAuthError: The YouTube Music session became invalid (search,
+                playlist creation or add). Propagated, not recorded as failed
+                tracks, so the worker can pause the job and resume it later
+                from the last state reported via ``state_callback``.
         """
         # Validation
         if not playlist_name:
@@ -225,6 +250,8 @@ class PlaylistMigrator:
                 name = self._shard_name(playlist_name, len(shard_ids), total_tracks)
                 try:
                     new_id = self._create_youtube_playlist(name)
+                except YouTubeAuthError:
+                    raise
                 except Exception as e:
                     logger.error(f"Failed to create YouTube Music playlist: {e}", exc_info=True)
                     raise RuntimeError(f"Failed to create playlist: {e}") from e
@@ -292,7 +319,19 @@ class PlaylistMigrator:
                         'reason': 'No match found above threshold'
                     })
                     logger.warning(f"[{idx}/{total_tracks}] No match: {track_name}")
-            
+
+            except YouTubeAuthError:
+                # Session expired mid-job. Do NOT record this (or any later)
+                # track as unmatched: propagate so BackgroundWorker parks the
+                # job as paused_auth. Durable state was emitted at the last
+                # flush; the pending matches are in match_cache and will be
+                # re-queued for writing on resume without another search.
+                logger.error(
+                    f"[{idx}/{total_tracks}] YouTube Music session expired while processing "
+                    f"{track_name}; pausing (resume point: track {final_index})"
+                )
+                raise
+
             except Exception as e:
                 failed_tracks.append({
                     'spotify_track': spotify_track,
@@ -394,11 +433,15 @@ class PlaylistMigrator:
             
             # Record request
             self.rate_limiter.record_request()
-            
+
             return playlist_id
-        
+
         except Exception as e:
             logger.error(f"Failed to create playlist '{playlist_name}': {e}")
+            if is_auth_error(e):
+                raise YouTubeAuthError(
+                    f"YouTube Music rejected the session while creating a playlist: {e}", cause=e
+                ) from e
             raise
     
     def _process_track(
@@ -500,6 +543,9 @@ class PlaylistMigrator:
         
         Raises:
             ValueError: If playlist_id is empty or video_ids is empty
+            YouTubeAuthError: The session is no longer valid (401/403 or
+                "provide authentication"). Raised immediately — an auth failure
+                is never counted as a failed batch.
         """
         if not playlist_id:
             raise ValueError("playlist_id cannot be empty")
@@ -542,7 +588,17 @@ class PlaylistMigrator:
                     # Success - break retry loop
                     break
                 
-                except YTMusicServerError as e:
+                except YouTubeAuthError:
+                    raise
+
+                except (YTMusicServerError, YTMusicUserError) as e:
+                    if is_auth_error(e):
+                        logger.error(f"YouTube Music auth failure on batch {batch_idx}: {e}")
+                        raise YouTubeAuthError(
+                            f"YouTube Music rejected the session while adding tracks: {e}",
+                            cause=e
+                        ) from e
+
                     # Handle 429 rate limit errors
                     if '429' in str(e) or 'rate limit' in str(e).lower():
                         logger.warning(

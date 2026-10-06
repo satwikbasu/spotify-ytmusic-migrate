@@ -188,6 +188,40 @@ class Notifier:
             sound=sound
         )
     
+    AUTH_REQUIRED_TITLE = "YouTube Music sign-in expired"
+    AUTH_REQUIRED_MESSAGE = "YouTube Music sign-in expired — reconnect to resume"
+
+    def notify_auth_required(
+        self,
+        playlist_name: Optional[str] = None,
+        sound: bool = True
+    ) -> None:
+        """Notify that the YouTube Music session expired and the job is paused.
+
+        Fired by ``BackgroundWorker`` when a job is parked as ``paused_auth``.
+        Nothing is lost: the job resumes from its saved state once the session
+        is reconnected (silently via the extension when the browser is open,
+        otherwise with one click).
+
+        Args:
+            playlist_name (Optional[str]): The playlist whose migration paused.
+            sound (bool): Play notification sound. Default: True — this one
+                needs the user's attention.
+
+        Example:
+            >>> notifier.notify_auth_required("Road Trip Mix")
+        """
+        message = self.AUTH_REQUIRED_MESSAGE
+        if playlist_name:
+            message = f"{playlist_name}: {message}"
+
+        self._send_notification(
+            title=f"⏸️ {self.AUTH_REQUIRED_TITLE}",
+            message=message,
+            timeout=30,
+            sound=sound
+        )
+
     def notify_rate_limit_pause(
         self,
         duration_seconds: int,

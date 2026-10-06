@@ -77,6 +77,10 @@ class MigrationManager:
     RATE_JITTER_SECONDS = 0.5
     RATE_PER_MINUTE_LIMIT = 40
 
+    # Job status reported while a YouTube Music reconnect is needed
+    # (mirrors BackgroundWorker.PAUSED_AUTH_STATUS).
+    PAUSED_AUTH_STATUS = BackgroundWorker.PAUSED_AUTH_STATUS
+
     def __init__(
         self,
         spotify_client: Spotify,
@@ -526,7 +530,11 @@ class MigrationManager:
                 - is_running (bool): Whether background worker is running
                 - throttle (Dict): Rate-limiter throttle state
                   (throttled, reason, until, message)
-        
+                - paused_auth_jobs (int): Jobs waiting for a YouTube Music
+                  reconnect (status 'paused_auth')
+                - auth_required (bool): True when paused_auth_jobs > 0; the
+                  UI/CLI should show "reconnect needed"
+
         Example:
             >>> status = manager.get_migration_status()
             >>> print(f"Progress: {status['completed_jobs']}/{status['total_jobs']}")
@@ -541,6 +549,7 @@ class MigrationManager:
         failed = sum(1 for job in all_jobs if job['status'] == 'failed')
         queued = sum(1 for job in all_jobs if job['status'] == 'queued')
         in_progress = sum(1 for job in all_jobs if job['status'] == 'in_progress')
+        paused_auth = sum(1 for job in all_jobs if job['status'] == self.PAUSED_AUTH_STATUS)
         
         # Get current job
         current_job = self.background_worker.get_current_job()
@@ -567,10 +576,71 @@ class MigrationManager:
             'is_paused': is_paused,
             'error_count': error_count,
             'is_running': self.background_worker.is_running.is_set(),
-            'throttle': self.get_throttle_state()
+            'throttle': self.get_throttle_state(),
+            # Reconnect-needed signal for the UI/CLI ("YouTube Music sign-in
+            # expired — reconnect to resume"). Derived from the job table so it
+            # is correct across restarts, not just for this process.
+            'paused_auth_jobs': paused_auth,
+            'auth_required': paused_auth > 0,
         }
-        
+
         return status
+
+    def reauthenticate_youtube(self, new_client: YTMusic) -> List[str]:
+        """Swap in a refreshed YouTube Music client and resume auth-paused jobs.
+
+        **This is the seam the Native-Messaging re-capture layer calls**
+        (contract §4.1 / §4.3). When a job hits a 401/403 or a silent sign-out,
+        the engine raises ``YouTubeAuthError`` → ``BackgroundWorker`` parks the
+        job as ``paused_auth`` → ``Notifier`` tells the user. The capture
+        extension (silently while the browser is open, otherwise after a
+        one-click prompt) re-reads the music.youtube.com cookies, the bridge
+        builds a fresh ``YTMusic`` client from them, and calls this method.
+        Nothing else is required: the client is injected into the existing
+        searcher and migrator (no reconstruction, cache/rate limiter intact)
+        and every ``paused_auth`` job is re-queued through the regular resume
+        path, continuing from the last track written to YouTube.
+
+        Args:
+            new_client (YTMusic): Authenticated client built from the
+                re-captured session.
+
+        Returns:
+            List[str]: Job IDs that were resumed.
+
+        Raises:
+            ValueError: If new_client is None.
+
+        Example:
+            >>> fresh = YTMusic(auth=headers_from_extension)
+            >>> resumed = manager.reauthenticate_youtube(fresh)
+            >>> manager.get_migration_status()['auth_required']
+            False
+        """
+        if new_client is None:
+            raise ValueError("new_client cannot be None")
+
+        logger.info("Re-authenticating YouTube Music: swapping client into searcher/migrator")
+        self.ytmusic_client = new_client
+        # The migrator forwards to its searcher; call the searcher too so the
+        # swap holds even if the migrator was replaced with something simpler.
+        self.playlist_migrator.set_client(new_client)
+        self.youtube_searcher.set_client(new_client)
+
+        resumed = self.background_worker.resume_auth_paused_jobs(
+            migrator_func=self.playlist_migrator.migrate_playlist,
+            progress_callback=self._make_resume_progress_wrapper()
+        )
+        if resumed:
+            logger.info(f"Resumed {len(resumed)} auth-paused migration(s)")
+        else:
+            logger.info("No auth-paused migrations to resume")
+        return list(resumed)
+
+    def is_auth_required(self) -> bool:
+        """True when at least one job is parked as ``paused_auth`` and a YouTube
+        Music reconnect (``reauthenticate_youtube``) is needed to continue."""
+        return self.get_migration_status()['auth_required']
     
     def pause_migrations(self) -> None:
         """Pause migrations after current job completes.

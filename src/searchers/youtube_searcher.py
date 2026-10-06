@@ -9,8 +9,9 @@ import logging
 from typing import List, Optional, Dict, Any
 
 from ytmusicapi import YTMusic
-from ytmusicapi.exceptions import YTMusicServerError
+from ytmusicapi.exceptions import YTMusicError, YTMusicServerError, YTMusicUserError
 
+from src.utils.errors import YouTubeAuthError, is_auth_error
 from src.utils.rate_limiter import RateLimiter
 from src.utils.string_utils import sanitize_for_search
 
@@ -40,7 +41,14 @@ class YouTubeSearcher:
     
     # Conservative delay between searches (1 second)
     SEARCH_DELAY = 1.0
-    
+
+    # Silent sign-out detection. A signed-out browser-cookie session does not
+    # raise: searches keep answering (often with nothing useful) and library
+    # calls return []. So identity is re-verified with get_account_info() on a
+    # cadence, and sooner when results look wrong (a run of empty searches).
+    IDENTITY_CHECK_INTERVAL = 50   # searches between routine identity checks
+    EMPTY_STREAK_THRESHOLD = 5     # consecutive empty searches that force one
+
     def __init__(self, ytmusic_client: YTMusic, rate_limiter: RateLimiter):
         """Initialize the YouTube Music searcher.
         
@@ -58,9 +66,109 @@ class YouTubeSearcher:
         
         self.ytmusic_client = ytmusic_client
         self.rate_limiter = rate_limiter
-        
+
+        # Identity-check bookkeeping (see IDENTITY_CHECK_INTERVAL)
+        self._searches_since_identity_check = 0
+        self._empty_result_streak = 0
+
         logger.info("YouTubeSearcher initialized")
-    
+
+    def set_client(self, ytmusic_client: YTMusic) -> None:
+        """Swap in a refreshed ytmusicapi client without rebuilding the searcher.
+
+        This is the client-swap seam for the auth-failure flow (contract §4.3):
+        after a ``YouTubeAuthError`` has paused the job, the extension's
+        Native-Messaging re-capture (§4.1) produces a new client and
+        ``MigrationManager.reauthenticate_youtube()`` injects it here before
+        resuming. Identity-check counters are reset so the new session is
+        verified early.
+
+        Raises:
+            ValueError: If ytmusic_client is None
+        """
+        if ytmusic_client is None:
+            raise ValueError("ytmusic_client cannot be None")
+        self.ytmusic_client = ytmusic_client
+        self._searches_since_identity_check = 0
+        self._empty_result_streak = 0
+        logger.info("YouTubeSearcher client replaced")
+
+    def verify_identity(self) -> Dict[str, Any]:
+        """Confirm the session is still signed in via ``get_account_info()``.
+
+        A signed-out cookie session fails silently (library calls return []),
+        so this is the only reliable check. The call goes through the rate
+        limiter like every other request.
+
+        Returns:
+            The account info dict (``accountName``, ``channelHandle``, ...).
+
+        Raises:
+            YouTubeAuthError: If the backend rejects the session (401/403 or
+                "provide authentication") or answers without an account —
+                i.e. we are signed out.
+        """
+        self._searches_since_identity_check = 0
+        self._empty_result_streak = 0
+        try:
+            self.rate_limiter.check_limit()
+            info = self.ytmusic_client.get_account_info()
+            self.rate_limiter.record_request()
+        except YouTubeAuthError:
+            raise
+        except ConnectionError as e:
+            # Inconclusive: the network is down, not the session. Let the
+            # regular search error handling deal with connectivity.
+            logger.warning(f"Identity check inconclusive (connection error): {e}")
+            return {}
+        except Exception as e:
+            if is_auth_error(e):
+                raise YouTubeAuthError(
+                    f"YouTube Music rejected the session during identity check: {e}", cause=e
+                ) from e
+            if isinstance(e, (YTMusicError, KeyError, IndexError, TypeError)):
+                # ytmusicapi could not find the account header in the response:
+                # the backend answered, but as an anonymous visitor.
+                raise YouTubeAuthError(
+                    "YouTube Music session appears signed out (no account in response)", cause=e
+                ) from e
+            logger.warning(f"Identity check inconclusive ({type(e).__name__}): {e}")
+            return {}
+
+        if not info or not isinstance(info, dict) or not (
+            info.get('accountName') or info.get('channelHandle')
+        ):
+            raise YouTubeAuthError(
+                "YouTube Music session appears signed out (get_account_info returned no account)"
+            )
+        logger.debug(f"Identity verified: {info.get('accountName') or info.get('channelHandle')}")
+        return info
+
+    def _note_search_outcome(self, results: List[Dict[str, Any]]) -> None:
+        """Track search outcomes and re-verify identity when due.
+
+        Called after every completed search. Raises YouTubeAuthError (instead
+        of letting the caller record "no match") when the session turns out
+        to be signed out.
+        """
+        self._searches_since_identity_check += 1
+        if results:
+            self._empty_result_streak = 0
+        else:
+            self._empty_result_streak += 1
+
+        due = (
+            self._searches_since_identity_check >= self.IDENTITY_CHECK_INTERVAL
+            or self._empty_result_streak >= self.EMPTY_STREAK_THRESHOLD
+        )
+        if due:
+            logger.info(
+                "Verifying YouTube Music identity "
+                f"({self._searches_since_identity_check} searches since last check, "
+                f"{self._empty_result_streak} empty in a row)"
+            )
+            self.verify_identity()
+
     def search_track(
         self,
         track_name: str,
@@ -93,8 +201,13 @@ class YouTubeSearcher:
             - duration: Duration string like "3:45" (str, optional)
             - duration_seconds: Duration in seconds (int, optional)
             
-            Returns empty list if no results found or error occurs.
-        
+            Returns empty list if no results found or a non-auth error occurs.
+
+        Raises:
+            YouTubeAuthError: The session is no longer valid (401/403, or a
+                silent sign-out detected by the periodic identity check).
+                Never swallowed into an empty result.
+
         Example:
             >>> searcher = YouTubeSearcher(ytmusic_client, rate_limiter)
             >>> results = searcher.search_track("Blinding Lights", ["The Weeknd"])
@@ -216,17 +329,33 @@ class YouTubeSearcher:
                 # Process and validate results
                 if not results:
                     logger.info(f"No results found for {search_type} search: {query}")
+                    # Silent sign-out check: raises YouTubeAuthError rather
+                    # than letting an empty result be recorded as "no match"
+                    self._note_search_outcome([])
                     return []
-                
+
                 # Validate and normalize results
                 validated_results = self._validate_results(results, query)
-                
+                self._note_search_outcome(validated_results)
+
                 logger.info(
                     f"Found {len(validated_results)} results for {search_type} search: {query}"
                 )
                 return validated_results
-            
-            except YTMusicServerError as e:
+
+            except YouTubeAuthError:
+                # Session invalid: never retry, never swallow — the worker
+                # pauses the job until a refreshed client is injected.
+                logger.error(f"YouTube Music session invalid during {search_type} search: {query}")
+                raise
+
+            except (YTMusicServerError, YTMusicUserError) as e:
+                if is_auth_error(e):
+                    logger.error(f"YouTube Music auth failure on {search_type} search: {e}")
+                    raise YouTubeAuthError(
+                        f"YouTube Music rejected the session: {e}", cause=e
+                    ) from e
+
                 # Handle 429 rate limit errors
                 if '429' in str(e) or 'rate limit' in str(e).lower():
                     logger.warning(f"429 rate limit error on attempt {attempt + 1}: {e}")

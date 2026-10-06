@@ -28,6 +28,7 @@ from typing import Optional, List, Dict, Any, Callable
 import sqlite3
 
 from src.utils.cache_manager import CacheManager
+from src.utils.errors import YouTubeAuthError
 from src.utils.notifier import Notifier
 
 logger = logging.getLogger(__name__)
@@ -67,7 +68,11 @@ class BackgroundWorker:
         # the owner, e.g. MigrationManager, or passed to resume_incomplete_migrations)
         self.default_migrator_func: Optional[Callable] = None
         self.default_progress_callback: Optional[Callable] = None
-        
+        # Set while the YouTube Music session is known to be invalid. Jobs
+        # pulled from the queue in that state are parked as paused_auth
+        # without touching the API; cleared by resume_auth_paused_jobs().
+        self.auth_required = threading.Event()
+
         # Initialize database table for migrations
         self._init_migrations_table()
         
@@ -81,8 +86,15 @@ class BackgroundWorker:
         'failed_tracks': 'INTEGER DEFAULT 0',
     }
     
-    # Statuses that mean "work still to do" after a restart
-    RESUMABLE_STATUSES = ('queued', 'in_progress')
+    # Job parked because the YouTube Music session expired mid-job. Distinct
+    # from 'failed' (nothing is wrong with the job) and from a user pause.
+    # Resumes via resume_auth_paused_jobs() once a fresh client is injected.
+    PAUSED_AUTH_STATUS = 'paused_auth'
+
+    # Statuses that mean "work still to do" after a restart. A paused_auth job
+    # is included: on restart the client is rebuilt from stored credentials,
+    # so it gets another go (and simply pauses again if they are still stale).
+    RESUMABLE_STATUSES = ('queued', 'in_progress', PAUSED_AUTH_STATUS)
     
     @staticmethod
     def _ensure_column(cursor: sqlite3.Cursor, table: str, column: str, decl: str) -> None:
@@ -100,7 +112,8 @@ class BackgroundWorker:
         - job_id: Unique job identifier (UUID)
         - playlist_name: Name of the playlist being migrated
         - playlist_id: Spotify playlist ID
-        - status: Job status (queued, in_progress, completed, failed)
+        - status: Job status (queued, in_progress, completed, failed,
+          paused_auth = waiting for a YouTube Music reconnect)
         - total_tracks: Total number of tracks to migrate
         - processed_tracks: Number of tracks processed so far
         - last_track_id: Last successfully processed track ID (for resume)
@@ -338,13 +351,27 @@ class BackgroundWorker:
                     
                     logger.info(f"Processing job {job_id}: '{playlist_name}'")
                     
+                    # Session already known to be invalid: park the job without
+                    # spending a request on it. Its resume state is untouched.
+                    if self.auth_required.is_set():
+                        logger.warning(
+                            f"Job {job_id} '{playlist_name}' parked as {self.PAUSED_AUTH_STATUS}: "
+                            "YouTube Music session invalid, waiting for reconnect"
+                        )
+                        self._update_job_status(
+                            job_id, self.PAUSED_AUTH_STATUS,
+                            error_message="YouTube Music sign-in expired - reconnect to resume"
+                        )
+                        self.job_queue.task_done()
+                        continue
+
                     # Set current job (thread-safe)
                     with self.current_job_lock:
                         self.current_job = job
-                    
+
                     # Update status to in_progress
                     self._update_job_status(job_id, 'in_progress', started_at=datetime.now())
-                    
+
                     try:
                         # Create progress wrapper that updates database
                         def progress_wrapper(
@@ -407,10 +434,17 @@ class BackgroundWorker:
                             playlist_url=playlist_url
                         )
                     
+                    except YouTubeAuthError as e:
+                        # Pause, don't fail. Progress is already durable: the
+                        # migrator reported every write through state_callback
+                        # (and progress_wrapper), so the row holds the exact
+                        # resume point. Nothing to persist here but the status.
+                        self._pause_for_auth(job_id, playlist_name, str(e))
+
                     except Exception as e:
                         error_message = str(e)
                         logger.error(f"Job {job_id} failed: {error_message}", exc_info=True)
-                        
+
                         # Update status to failed
                         self._update_job_status(
                             job_id,
@@ -445,6 +479,68 @@ class BackgroundWorker:
         
         logger.info("Worker loop stopped")
     
+    def _pause_for_auth(self, job_id: str, playlist_name: str, reason: str) -> None:
+        """Park ``job_id`` as paused_auth and tell the user to reconnect.
+
+        Sets ``auth_required`` so any further queued jobs are parked too
+        (without burning API calls on a dead session). The user-facing
+        notification fires once per outage, not once per job.
+        """
+        logger.warning(
+            f"Job {job_id} '{playlist_name}' paused: YouTube Music session invalid ({reason})"
+        )
+        self._update_job_status(
+            job_id,
+            self.PAUSED_AUTH_STATUS,
+            error_message=f"YouTube Music sign-in expired - reconnect to resume ({reason})"
+        )
+        first_outage = not self.auth_required.is_set()
+        self.auth_required.set()
+        if first_outage:
+            try:
+                self.notifier.notify_auth_required(playlist_name=playlist_name)
+            except Exception as e:  # notifications are non-critical
+                logger.error(f"Auth-required notification failed: {str(e)}")
+
+    def get_auth_paused_jobs(self) -> List[Dict[str, Any]]:
+        """Jobs currently parked as paused_auth (see get_all_jobs for the shape)."""
+        return self.get_all_jobs(status=self.PAUSED_AUTH_STATUS, limit=1000)
+
+    def is_auth_required(self) -> bool:
+        """True while a reconnect is needed: the worker saw an auth failure
+        this run, or paused_auth jobs are waiting in the database."""
+        if self.auth_required.is_set():
+            return True
+        try:
+            return len(self.get_auth_paused_jobs()) > 0
+        except sqlite3.Error:
+            return False
+
+    def resume_auth_paused_jobs(
+        self,
+        migrator_func: Optional[Callable] = None,
+        progress_callback: Optional[Callable] = None
+    ) -> List[str]:
+        """Re-queue every paused_auth job so it continues from its saved state.
+
+        Call after the refreshed YouTube Music client has been injected into
+        the searcher/migrator (``MigrationManager.reauthenticate_youtube()``
+        does both). Uses the same resume path as crash recovery: source tracks
+        reloaded from the ``tracks`` table, destination playlist ids and the
+        last-added index from the job row, decided matches from ``match_cache``.
+
+        Returns:
+            List[str]: Job IDs that were re-queued (or failed because their
+                source tracks are gone).
+        """
+        self.auth_required.clear()
+        resumed = self._requeue_jobs(
+            (self.PAUSED_AUTH_STATUS,), migrator_func, progress_callback
+        )
+        if resumed:
+            logger.info(f"Re-queued {len(resumed)} auth-paused migration(s) after reconnect")
+        return resumed
+
     def _update_job_status(
         self,
         job_id: str,
@@ -643,16 +739,26 @@ class BackgroundWorker:
         Raises:
             sqlite3.Error: If database query fails.
         """
+        return self._requeue_jobs(self.RESUMABLE_STATUSES, migrator_func, progress_callback)
+
+    def _requeue_jobs(
+        self,
+        statuses: tuple,
+        migrator_func: Optional[Callable],
+        progress_callback: Optional[Callable]
+    ) -> List[str]:
+        """Shared resume path: re-queue every job whose status is in ``statuses``
+        with its persisted resume state (see resume_incomplete_migrations)."""
         resumed_jobs: List[str] = []
         migrator_func = migrator_func or self.default_migrator_func
         progress_callback = progress_callback or self.default_progress_callback
-        
+
         try:
             cursor = self.cache_manager.connection.cursor()
-            
+
             # Find incomplete migrations (queued-but-never-run jobs were lost
             # with the in-memory queue, so they are incomplete too)
-            placeholders = ', '.join('?' for _ in self.RESUMABLE_STATUSES)
+            placeholders = ', '.join('?' for _ in statuses)
             cursor.execute(f"""
                 SELECT job_id, playlist_name, playlist_id, total_tracks,
                        youtube_playlist_ids, added_tracks, last_added_index,
@@ -660,8 +766,8 @@ class BackgroundWorker:
                 FROM migrations
                 WHERE status IN ({placeholders})
                 ORDER BY COALESCE(started_at, created_at) ASC
-            """, self.RESUMABLE_STATUSES)
-            
+            """, tuple(statuses))
+
             incomplete_jobs = cursor.fetchall()
             
             if not incomplete_jobs:
