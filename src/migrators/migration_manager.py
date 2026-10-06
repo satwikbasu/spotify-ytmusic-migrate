@@ -71,7 +71,12 @@ class MigrationManager:
         >>> print(manager.get_migration_status())
         >>> manager.stop()
     """
-    
+
+    # Sustained-rate policy for the internal web API (see RateLimiter docstring).
+    RATE_MIN_INTERVAL_SECONDS = 1.0
+    RATE_JITTER_SECONDS = 0.5
+    RATE_PER_MINUTE_LIMIT = 40
+
     def __init__(
         self,
         spotify_client: Spotify,
@@ -120,12 +125,31 @@ class MigrationManager:
         self.ytmusic_client = ytmusic_client
         self.cache_manager = cache_manager
         
-        # Initialize rate limiter (15k daily, 100 per minute)
+        # Throttle visibility: the limiter reports state changes here; the UI/CLI
+        # can read get_throttle_state() or attach set_throttle_callback().
+        self._throttle_callback: Optional[Callable[[Dict[str, Any]], None]] = None
+        self._throttle_state: Dict[str, Any] = {
+            'throttled': False, 'reason': None, 'until': None, 'message': ''
+        }
+        self._throttle_lock = threading.Lock()
+
+        # Initialize rate limiter with the sustained-rate policy for the
+        # internal web API (paced min-interval + jitter, per-minute ceiling,
+        # no Data-API-style daily cap). Counters persist in the app DB so a
+        # restart does not reset them.
         self.rate_limiter = RateLimiter(
-            daily_limit=15000,
-            per_minute_limit=100
+            daily_limit=None,
+            per_minute_limit=self.RATE_PER_MINUTE_LIMIT,
+            min_interval=self.RATE_MIN_INTERVAL_SECONDS,
+            jitter=self.RATE_JITTER_SECONDS,
+            db_path=getattr(cache_manager, 'db_path', None),
+            on_throttle=self._on_throttle_state_change,
         )
-        logger.info("Initialized RateLimiter: 15k/day, 100/min")
+        logger.info(
+            f"Initialized RateLimiter: {self.RATE_MIN_INTERVAL_SECONDS}s "
+            f"(+{self.RATE_JITTER_SECONDS}s jitter) between requests, "
+            f"{self.RATE_PER_MINUTE_LIMIT}/min, persistent counters"
+        )
         
         # Initialize YouTube searcher
         self.youtube_searcher = YouTubeSearcher(
@@ -232,6 +256,44 @@ class MigrationManager:
         """
         self._resume_progress_callback = progress_callback
     
+    def _on_throttle_state_change(self, state: Dict[str, Any]) -> None:
+        """Receive throttle-state changes from the RateLimiter (worker thread)."""
+        with self._throttle_lock:
+            self._throttle_state = dict(state)
+            callback = self._throttle_callback
+        if state.get('throttled'):
+            logger.warning(f"Throttled: {state.get('message')}")
+        else:
+            logger.info("Throttle cleared")
+        if callback:
+            try:
+                callback(dict(state))
+            except Exception as e:
+                logger.error(f"Throttle callback error: {str(e)}")
+
+    def set_throttle_callback(
+        self,
+        callback: Optional[Callable[[Dict[str, Any]], None]]
+    ) -> None:
+        """Attach a callback invoked whenever the throttle state changes.
+
+        The callback receives ``{'throttled', 'reason', 'until', 'message'}``
+        (see RateLimiter.get_throttle_state()). Called from the worker thread.
+        """
+        with self._throttle_lock:
+            self._throttle_callback = callback
+
+    def get_throttle_state(self) -> Dict[str, Any]:
+        """Current throttle state: ``{'throttled': bool, 'reason': 'rate'|'quota'|None,
+        'until': epoch seconds or None, 'message': str}``."""
+        getter = getattr(self.rate_limiter, 'get_throttle_state', None)
+        if callable(getter):
+            state = getter()
+            if isinstance(state, dict):
+                return state
+        with self._throttle_lock:
+            return dict(self._throttle_state)
+
     def _make_resume_progress_wrapper(self) -> Callable:
         """Worker-style progress callback that forwards resumed jobs' progress
         to whatever UI callback is attached at call time."""
@@ -269,6 +331,14 @@ class MigrationManager:
         # Stop background worker
         self.background_worker.stop(timeout=timeout)
         logger.info("Background worker stopped")
+
+        # Flush persisted rate-limit counters.
+        close = getattr(self.rate_limiter, 'close', None)
+        if callable(close):
+            try:
+                close()
+            except Exception as e:
+                logger.warning(f"Could not close rate limiter cleanly: {str(e)}")
         
         # Log final statistics
         all_jobs = self.background_worker.get_all_jobs(limit=1000)
@@ -454,6 +524,8 @@ class MigrationManager:
                 - is_paused (bool): Whether migrations are paused
                 - error_count (int): Total number of errors logged
                 - is_running (bool): Whether background worker is running
+                - throttle (Dict): Rate-limiter throttle state
+                  (throttled, reason, until, message)
         
         Example:
             >>> status = manager.get_migration_status()
@@ -494,7 +566,8 @@ class MigrationManager:
             'queue_size': queue_size,
             'is_paused': is_paused,
             'error_count': error_count,
-            'is_running': self.background_worker.is_running.is_set()
+            'is_running': self.background_worker.is_running.is_set(),
+            'throttle': self.get_throttle_state()
         }
         
         return status

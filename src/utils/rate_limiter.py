@@ -1,324 +1,580 @@
 """Rate Limiting Module.
 
-This module provides rate limiting functionality to comply with API rate limits
-and handle HTTP 429 (Too Many Requests) responses gracefully.
+Sustained-rate pacing for the internal web APIs this app drives (ytmusicapi and
+Spotify Web API), with persistent counters and a *visible* throttle state.
+
+Policy (why it looks like this)
+-------------------------------
+The app talks to YouTube Music through ytmusicapi -- the same internal endpoints
+the web player uses -- not the YouTube Data API v3. There is no published quota
+to count against; what matters is to look like a steady, human-paced client and
+never burst. So the policy is:
+
+* a minimum interval between requests, with random jitter, so throughput is
+  *paced* rather than cliff-stopped;
+* a per-minute ceiling as a safety net against accidental bursts;
+* an *optional* daily ceiling (off by default) for callers that want one;
+* HTTP 429 handling with exponential backoff that honours ``Retry-After``, and a
+  distinct ``'quota'`` reason for Spotify dev-mode ``QUOTA_EXCEEDED`` responses.
+
+Every wait is bounded and observable: long waits are taken in slices of at most
+``max_wait_slice`` seconds, the current throttle state is readable at any time
+via :meth:`RateLimiter.get_throttle_state`, and an optional ``on_throttle``
+callback is invoked whenever that state changes. There is no silent hour-long
+sleep anywhere in this module.
+
+Counters survive restarts: when a ``db_path`` is given, the limiter keeps its
+state in its own ``rate_limit_state`` table inside the app's SQLite database
+(the same file ``CacheManager`` uses, but a separate connection and table). If
+the database is unavailable the limiter degrades to in-memory operation.
+
+Typical use (unchanged from the previous API)::
+
+    limiter.check_limit()           # paces / blocks as needed
+    response = api.call()
+    limiter.record_request()
+    limiter.reset_backoff()
+
+    # on HTTP 429:
+    limiter.handle_429(retry_after)                     # transient rate limit
+    limiter.handle_429(retry_after, reason='quota')     # QUOTA_EXCEEDED
 """
 
-import time
+import json
 import logging
+import random
+import sqlite3
+import threading
+import time
 from collections import deque
-from datetime import datetime, date, timedelta
-from typing import Optional, Deque
+from datetime import date, datetime, timedelta
+from typing import Any, Callable, Deque, Dict, Optional
 
 
-# Configure logging
 logger = logging.getLogger(__name__)
 
 
+ThrottleCallback = Callable[[Dict[str, Any]], None]
+
+
 class RateLimiter:
-    """API rate limiter with daily and per-minute limits.
-    
-    This class tracks and enforces rate limits to prevent exceeding API quotas.
-    It supports both daily operation limits and per-minute request rates, with
-    automatic counter resets and exponential backoff for rate limit errors.
-    
-    Features:
-    - Daily operation limit tracking (default: 15,000/day)
-    - Per-minute rate limiting (default: 100 requests/minute)
-    - Automatic daily counter reset at midnight
-    - Exponential backoff for HTTP 429 responses
-    - Configurable limits for different APIs
-    
+    """Sustained-rate API limiter with persistent counters and visible state.
+
     Attributes:
-        daily_limit (int): Maximum operations allowed per day.
-        per_minute_limit (int): Maximum requests allowed per minute.
-        daily_operations (int): Current count of operations today.
-        last_reset (date): Date of last daily counter reset.
-        request_times (Deque[float]): Timestamps of recent requests (for rate tracking).
-        backoff_seconds (int): Current backoff duration for 429 responses.
+        per_minute_limit (int): Burst ceiling -- max requests in any 60 s window.
+        min_interval (float): Minimum seconds between two requests (before jitter).
+        jitter (float): Upper bound of the random extra delay added to min_interval.
+        daily_limit (Optional[int]): Optional daily ceiling; ``None`` = no ceiling.
+        daily_operations (int): Requests recorded today.
+        last_reset (date): Day the daily counter belongs to.
+        request_times (Deque[float]): Timestamps of the most recent requests.
+        backoff_seconds (int): Current exponential backoff for 429 responses.
     """
-    
-    DEFAULT_DAILY_LIMIT = 15000
-    DEFAULT_PER_MINUTE_LIMIT = 100
+
+    # Sustained-rate policy defaults (internal web API, not a Data-API quota).
+    DEFAULT_PER_MINUTE_LIMIT = 40
+    DEFAULT_MIN_INTERVAL_SECONDS = 1.0
+    DEFAULT_JITTER_SECONDS = 0.5
+    DEFAULT_DAILY_LIMIT: Optional[int] = None
+
+    # 429 backoff.
     MIN_BACKOFF_SECONDS = 60
     MAX_BACKOFF_SECONDS = 300
-    PAUSE_ON_DAILY_LIMIT_HOURS = 1
-    
-    def __init__(self, daily_limit: int = DEFAULT_DAILY_LIMIT, per_minute_limit: int = DEFAULT_PER_MINUTE_LIMIT):
-        """Initialize the rate limiter with specified limits.
-        
+
+    # Longest single sleep. Longer waits are taken in slices so the state
+    # stays observable and an interrupt can end them early.
+    DEFAULT_MAX_WAIT_SLICE_SECONDS = 30.0
+
+    # Pacing waits shorter than this are ordinary throughput shaping and do not
+    # flip the visible "throttled" state.
+    THROTTLE_VISIBILITY_THRESHOLD_SECONDS = 5.0
+
+    REASON_RATE = 'rate'
+    REASON_QUOTA = 'quota'
+
+    TABLE_NAME = 'rate_limit_state'
+
+    def __init__(
+        self,
+        daily_limit: Optional[int] = DEFAULT_DAILY_LIMIT,
+        per_minute_limit: int = DEFAULT_PER_MINUTE_LIMIT,
+        min_interval: float = DEFAULT_MIN_INTERVAL_SECONDS,
+        jitter: float = DEFAULT_JITTER_SECONDS,
+        db_path: Optional[str] = None,
+        on_throttle: Optional[ThrottleCallback] = None,
+        max_wait_slice: float = DEFAULT_MAX_WAIT_SLICE_SECONDS,
+        interrupt_event: Optional[threading.Event] = None,
+    ):
+        """Create a limiter.
+
         Args:
-            daily_limit (int): Maximum number of operations allowed per day.
-                Defaults to 15,000.
-            per_minute_limit (int): Maximum number of requests allowed per minute.
-                Defaults to 100.
-                
+            daily_limit: Optional daily request ceiling. ``None`` (default)
+                disables the daily ceiling entirely. Hitting a configured ceiling
+                sets a visible ``'quota'`` throttle until local midnight; it never
+                sleeps silently.
+            per_minute_limit: Maximum requests in any rolling 60 s window.
+            min_interval: Minimum seconds between consecutive requests.
+            jitter: Random extra delay in ``[0, jitter]`` added to ``min_interval``.
+            db_path: SQLite file to persist counters in (own table). ``None``
+                keeps everything in memory.
+            on_throttle: Called with the throttle-state dict whenever the state
+                changes (throttled on/off, reason, until).
+            max_wait_slice: Longest single ``time.sleep`` call.
+            interrupt_event: Optional event; when set, any in-progress wait ends
+                early (used by shutdown).
+
         Raises:
-            ValueError: If limits are not positive integers.
+            ValueError: If a limit is not positive or an interval is negative.
         """
-        if daily_limit <= 0 or per_minute_limit <= 0:
+        if daily_limit is not None and daily_limit <= 0:
             raise ValueError("Rate limits must be positive integers")
-        
+        if per_minute_limit <= 0:
+            raise ValueError("Rate limits must be positive integers")
+        if min_interval < 0 or jitter < 0:
+            raise ValueError("min_interval and jitter must be non-negative")
+        if max_wait_slice <= 0:
+            raise ValueError("max_wait_slice must be positive")
+
         self.daily_limit = daily_limit
         self.per_minute_limit = per_minute_limit
-        
-        # Daily operation tracking
+        self.min_interval = float(min_interval)
+        self.jitter = float(jitter)
+        self.max_wait_slice = float(max_wait_slice)
+        self.on_throttle = on_throttle
+        self.interrupt_event = interrupt_event
+
+        self._lock = threading.RLock()
+
+        # Counters.
         self.daily_operations = 0
-        self.last_reset = date.today()
-        
-        # Per-minute rate tracking using a deque with fixed size
-        # Only keeps the most recent per_minute_limit timestamps
+        self.last_reset: date = self._today()
         self.request_times: Deque[float] = deque(maxlen=per_minute_limit)
-        
-        # Backoff tracking for 429 responses
+        self.last_request_at: Optional[float] = None
         self.backoff_seconds = self.MIN_BACKOFF_SECONDS
-        
+
+        # Visible throttle state.
+        self._throttled_until: Optional[float] = None
+        self._throttle_reason: Optional[str] = None
+        self._throttle_message: str = ''
+
+        # Persistence (own connection, own table; never touches CacheManager).
+        self.db_path = db_path
+        self._conn: Optional[sqlite3.Connection] = None
+        self._init_persistence()
+        self._load_state()
+
         logger.info(
-            f"RateLimiter initialized: {daily_limit} ops/day, "
-            f"{per_minute_limit} requests/minute"
+            "RateLimiter initialized: min_interval=%.2fs (+%.2fs jitter), "
+            "%d requests/min, daily_limit=%s, persistence=%s",
+            self.min_interval, self.jitter, self.per_minute_limit,
+            self.daily_limit, 'on' if self._conn is not None else 'off',
         )
-    
-    def _reset_daily_counter(self) -> None:
-        """Reset the daily operations counter if it's a new day.
-        
-        Checks if the current date is different from last_reset, and if so,
-        resets the daily_operations counter to 0 and updates last_reset.
+
+    # ------------------------------------------------------------------
+    # Time helpers (all go through time.time so tests can control the clock)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _now() -> float:
+        return time.time()
+
+    @classmethod
+    def _today(cls) -> date:
+        return datetime.fromtimestamp(cls._now()).date()
+
+    @classmethod
+    def _next_local_midnight(cls) -> float:
+        now_dt = datetime.fromtimestamp(cls._now())
+        midnight = datetime.combine(now_dt.date() + timedelta(days=1), datetime.min.time())
+        return midnight.timestamp()
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+    def _init_persistence(self) -> None:
+        if not self.db_path:
+            return
+        try:
+            self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self._conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {self.TABLE_NAME} "
+                "(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            self._conn.commit()
+        except sqlite3.Error as e:
+            logger.warning(
+                f"Rate-limit state will not persist (could not open {self.db_path}): {e}"
+            )
+            self._conn = None
+
+    def _load_state(self) -> None:
+        if self._conn is None:
+            return
+        try:
+            rows = self._conn.execute(
+                f"SELECT key, value FROM {self.TABLE_NAME}"
+            ).fetchall()
+        except sqlite3.Error as e:
+            logger.warning(f"Could not load rate-limit state: {e}")
+            return
+        state = {k: v for k, v in rows}
+        if not state:
+            return
+        try:
+            if 'last_reset' in state:
+                self.last_reset = date.fromisoformat(state['last_reset'])
+            self.daily_operations = int(state.get('daily_operations', 0))
+            times = json.loads(state.get('request_times', '[]'))
+            self.request_times = deque(
+                (float(t) for t in times), maxlen=self.per_minute_limit
+            )
+            last = state.get('last_request_at')
+            self.last_request_at = float(last) if last not in (None, '', 'null') else None
+            self.backoff_seconds = int(state.get('backoff_seconds', self.MIN_BACKOFF_SECONDS))
+            until = state.get('throttled_until')
+            if until not in (None, '', 'null'):
+                until_f = float(until)
+                if until_f > self._now():
+                    self._throttled_until = until_f
+                    self._throttle_reason = state.get('throttle_reason') or self.REASON_RATE
+                    self._throttle_message = state.get('throttle_message') or self._format_message(
+                        self._throttle_reason, until_f
+                    )
+        except (ValueError, TypeError, json.JSONDecodeError) as e:
+            logger.warning(f"Ignoring corrupt rate-limit state: {e}")
+            return
+        self._roll_daily_counter()
+        logger.info(
+            "Restored rate-limit state: %d requests today, %d in window, backoff=%ds%s",
+            self.daily_operations, len(self.request_times), self.backoff_seconds,
+            f", throttled until {self._fmt_clock(self._throttled_until)}" if self._throttled_until else '',
+        )
+
+    def _save_state(self) -> None:
+        if self._conn is None:
+            return
+        rows = {
+            'daily_operations': str(self.daily_operations),
+            'last_reset': self.last_reset.isoformat(),
+            'request_times': json.dumps(list(self.request_times)),
+            'last_request_at': json.dumps(self.last_request_at),
+            'backoff_seconds': str(self.backoff_seconds),
+            'throttled_until': json.dumps(self._throttled_until),
+            'throttle_reason': self._throttle_reason or '',
+            'throttle_message': self._throttle_message,
+        }
+        try:
+            self._conn.executemany(
+                f"INSERT OR REPLACE INTO {self.TABLE_NAME} (key, value) VALUES (?, ?)",
+                list(rows.items()),
+            )
+            self._conn.commit()
+        except sqlite3.Error as e:
+            logger.warning(f"Could not persist rate-limit state: {e}")
+
+    def close(self) -> None:
+        """Flush state and close the persistence connection (idempotent)."""
+        with self._lock:
+            if self._conn is None:
+                return
+            self._save_state()
+            try:
+                self._conn.close()
+            except sqlite3.Error:
+                pass
+            self._conn = None
+
+    # ------------------------------------------------------------------
+    # Throttle state
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _fmt_clock(ts: Optional[float]) -> str:
+        if ts is None:
+            return ''
+        return datetime.fromtimestamp(ts).strftime('%H:%M')
+
+    def _format_message(self, reason: Optional[str], until: Optional[float]) -> str:
+        if reason is None or until is None:
+            return ''
+        clock = self._fmt_clock(until)
+        if reason == self.REASON_QUOTA:
+            return f"Quota exhausted - throttled until {clock}"
+        return f"Rate limited - throttled until {clock}"
+
+    def _set_throttle(self, reason: Optional[str], until: Optional[float], message: str = '') -> None:
+        """Update the visible throttle state and notify if it changed."""
+        changed = (reason, until) != (self._throttle_reason, self._throttled_until)
+        self._throttle_reason = reason
+        self._throttled_until = until
+        self._throttle_message = message or self._format_message(reason, until)
+        if changed:
+            self._save_state()
+            self._notify()
+
+    def _clear_throttle(self) -> None:
+        if self._throttled_until is not None or self._throttle_reason is not None:
+            self._set_throttle(None, None, '')
+
+    def _notify(self) -> None:
+        if self.on_throttle is None:
+            return
+        try:
+            self.on_throttle(self.get_throttle_state())
+        except Exception as e:  # a UI callback must never break the engine
+            logger.error(f"Throttle callback raised: {e}")
+
+    def get_throttle_state(self) -> Dict[str, Any]:
+        """Return the current throttle state for the UI/CLI.
+
+        Returns:
+            dict: ``{'throttled': bool, 'reason': 'rate'|'quota'|None,
+            'until': epoch-seconds or None, 'message': str}``. A throttle whose
+            ``until`` has passed is reported (and cleared) as not throttled.
         """
-        today = date.today()
+        with self._lock:
+            if self._throttled_until is not None and self._now() >= self._throttled_until:
+                self._clear_throttle()
+            throttled = self._throttled_until is not None
+            return {
+                'throttled': throttled,
+                'reason': self._throttle_reason if throttled else None,
+                'until': self._throttled_until if throttled else None,
+                'message': self._throttle_message if throttled else '',
+            }
+
+    # ------------------------------------------------------------------
+    # Waiting (bounded, observable, interruptible)
+    # ------------------------------------------------------------------
+    def _wait(self, seconds: float) -> None:
+        """Sleep ``seconds`` in slices of at most ``max_wait_slice``."""
+        remaining = float(seconds)
+        while remaining > 0:
+            if self.interrupt_event is not None and self.interrupt_event.is_set():
+                logger.info("Rate-limit wait interrupted")
+                return
+            step = min(remaining, self.max_wait_slice)
+            time.sleep(step)
+            remaining -= step
+
+    def _wait_until(self, until: float) -> None:
+        """Wait until the clock reaches ``until`` (re-reads the clock each slice)."""
+        while True:
+            if self.interrupt_event is not None and self.interrupt_event.is_set():
+                logger.info("Rate-limit wait interrupted")
+                return
+            remaining = until - self._now()
+            if remaining <= 0:
+                return
+            time.sleep(min(remaining, self.max_wait_slice))
+
+    # ------------------------------------------------------------------
+    # Core checks
+    # ------------------------------------------------------------------
+    def _roll_daily_counter(self) -> None:
+        today = self._today()
         if today > self.last_reset:
             logger.info(
-                f"Daily counter reset: {self.daily_operations} operations "
-                f"on {self.last_reset}"
+                f"Daily counter reset: {self.daily_operations} operations on {self.last_reset}"
             )
             self.daily_operations = 0
             self.last_reset = today
-    
-    def _check_daily_limit(self) -> None:
-        """Check if daily operation limit has been reached.
-        
-        If the daily limit is reached or exceeded, pauses execution for
-        1 hour to avoid further quota violations.
-        
-        Raises:
-            None, but sleeps for PAUSE_ON_DAILY_LIMIT_HOURS if limit reached.
-        """
-        if self.daily_operations >= self.daily_limit:
-            pause_seconds = self.PAUSE_ON_DAILY_LIMIT_HOURS * 3600
-            logger.warning(
-                f"Daily limit reached ({self.daily_operations}/{self.daily_limit}). "
-                f"Pausing for {self.PAUSE_ON_DAILY_LIMIT_HOURS} hour(s)."
-            )
-            time.sleep(pause_seconds)
-            
-            # Check if we've crossed into a new day during the pause
-            self._reset_daily_counter()
-    
-    def _check_per_minute_rate(self) -> None:
-        """Check if per-minute request rate is being exceeded.
-        
-        Examines the timestamps in request_times to determine if we're
-        exceeding the per-minute rate limit. If so, calculates the required
-        wait time and pauses execution.
-        
-        The deque automatically maintains only the most recent per_minute_limit
-        requests, making rate calculation efficient.
-        """
+            if self._throttle_reason == self.REASON_QUOTA and self.daily_limit is not None:
+                self._clear_throttle()
+
+    # Backwards-compatible name used by older code/tests.
+    _reset_daily_counter = _roll_daily_counter
+
+    def _pacing_wait_seconds(self) -> float:
+        """Seconds to wait for the min-interval (+jitter) policy."""
+        if self.last_request_at is None or (self.min_interval <= 0 and self.jitter <= 0):
+            return 0.0
+        target = self.min_interval + (random.uniform(0.0, self.jitter) if self.jitter > 0 else 0.0)
+        elapsed = self._now() - self.last_request_at
+        return max(0.0, target - elapsed)
+
+    def _window_wait_seconds(self) -> float:
+        """Seconds until the rolling 60 s window has room for one more request."""
+        now = self._now()
+        while self.request_times and now - self.request_times[0] >= 60:
+            self.request_times.popleft()
         if len(self.request_times) < self.per_minute_limit:
-            # Haven't reached the limit yet, no need to wait
-            return
-        
-        # The deque is full, check if all requests are within the last minute
-        current_time = time.time()
-        oldest_request = self.request_times[0]
-        time_since_oldest = current_time - oldest_request
-        
-        # If the oldest request in our window is less than 60 seconds old,
-        # we need to wait before making another request
-        if time_since_oldest < 60:
-            wait_time = 60 - time_since_oldest
-            logger.info(
-                f"Per-minute rate limit approaching ({self.per_minute_limit} requests/min). "
-                f"Waiting {wait_time:.2f} seconds."
-            )
-            time.sleep(wait_time)
-    
+            return 0.0
+        return max(0.0, 60.0 - (now - self.request_times[0]))
+
     def check_limit(self) -> None:
-        """Check rate limits before making an API request.
-        
-        This method should be called before each API request to ensure
-        compliance with rate limits. It performs the following checks:
-        
-        1. Resets daily counter if it's a new day
-        2. Checks if daily limit has been reached (pauses if so)
-        3. Checks if per-minute rate is being exceeded (waits if so)
-        
-        The method will block (sleep) if necessary to comply with limits.
-        
-        Example:
-            >>> limiter = RateLimiter()
-            >>> limiter.check_limit()  # Checks limits
-            >>> # Make API request here
-            >>> limiter.record_request()  # Record the request
+        """Block as needed so the next request complies with the policy.
+
+        Order: daily ceiling (if configured) -> per-minute window -> pacing.
+        Long waits are sliced and the throttle state is visible throughout.
         """
-        # Reset daily counter if needed
-        self._reset_daily_counter()
-        
-        # Check daily limit
-        self._check_daily_limit()
-        
-        # Check per-minute rate
-        self._check_per_minute_rate()
-    
+        with self._lock:
+            self._roll_daily_counter()
+
+            # 1. Optional daily ceiling: visible 'quota' throttle until midnight.
+            if self.daily_limit is not None and self.daily_operations >= self.daily_limit:
+                until = self._next_local_midnight()
+                logger.warning(
+                    f"Daily ceiling reached ({self.daily_operations}/{self.daily_limit}); "
+                    f"throttled until {self._fmt_clock(until)}"
+                )
+                self._set_throttle(self.REASON_QUOTA, until)
+                self._wait_until(until)
+                self._roll_daily_counter()
+                if self.daily_limit is not None and self.daily_operations >= self.daily_limit:
+                    # Interrupted before midnight: leave the state visible and return;
+                    # the caller is shutting down.
+                    return
+
+            # 2. Per-minute ceiling.
+            window_wait = self._window_wait_seconds()
+            if window_wait > 0:
+                until = self._now() + window_wait
+                logger.info(
+                    f"Per-minute ceiling ({self.per_minute_limit}/min) reached; "
+                    f"waiting {window_wait:.1f}s"
+                )
+                if window_wait >= self.THROTTLE_VISIBILITY_THRESHOLD_SECONDS:
+                    self._set_throttle(self.REASON_RATE, until)
+                self._wait(window_wait)
+
+            # 3. Steady pacing with jitter.
+            pacing_wait = self._pacing_wait_seconds()
+            if pacing_wait > 0:
+                self._wait(pacing_wait)
+
+            # Any throttle whose deadline has passed is cleared here.
+            if self._throttled_until is not None and self._now() >= self._throttled_until:
+                self._clear_throttle()
+
     def record_request(self) -> None:
-        """Record that an API request was made.
-        
-        Updates tracking counters after a successful API request:
-        - Appends current timestamp to request_times deque
-        - Increments daily_operations counter
-        
-        This method should be called immediately after making an API request.
-        
-        Example:
-            >>> limiter = RateLimiter()
-            >>> limiter.check_limit()
-            >>> response = api.make_request()  # Your API call
-            >>> limiter.record_request()
-        """
-        current_time = time.time()
-        self.request_times.append(current_time)
-        self.daily_operations += 1
-        
-        logger.debug(
-            f"Request recorded: {self.daily_operations}/{self.daily_limit} daily, "
-            f"{len(self.request_times)} requests in current window"
-        )
-    
-    def handle_429(self, retry_after: Optional[int] = None) -> None:
-        """Handle HTTP 429 (Too Many Requests) response.
-        
-        Implements intelligent backoff when receiving rate limit errors:
-        
-        1. If Retry-After header is provided, uses that value
-        2. Otherwise, uses exponential backoff starting at 60 seconds,
-           doubling with each 429, up to a maximum of 300 seconds
-        3. Sleeps for the calculated duration
-        4. Resets backoff on successful requests (call reset_backoff())
-        
+        """Record that a request was just made (and persist the counters)."""
+        with self._lock:
+            now = self._now()
+            self._roll_daily_counter()
+            self.request_times.append(now)
+            self.last_request_at = now
+            self.daily_operations += 1
+            self._save_state()
+            logger.debug(
+                f"Request recorded: {self.daily_operations} today, "
+                f"{len(self.request_times)} in current window"
+            )
+
+    def handle_429(self, retry_after: Optional[int] = None, reason: Optional[str] = None) -> None:
+        """Back off after an HTTP 429.
+
         Args:
-            retry_after (Optional[int]): Value from Retry-After header in seconds.
-                If None, uses exponential backoff.
-                
-        Example:
-            >>> limiter = RateLimiter()
-            >>> try:
-            ...     response = api.make_request()
-            ...     if response.status_code == 429:
-            ...         retry_after = response.headers.get('Retry-After')
-            ...         limiter.handle_429(int(retry_after) if retry_after else None)
-            ... except Exception as e:
-            ...     pass
+            retry_after: Seconds from the ``Retry-After`` header, if present.
+                Honoured exactly when given.
+            reason: ``'quota'`` (or Spotify's literal ``'QUOTA_EXCEEDED'``) marks
+                a quota-exhaustion 429, which is surfaced with throttle reason
+                ``'quota'``. Anything else is a transient rate limit (``'rate'``).
+
+        Without ``retry_after`` the wait is the current exponential backoff
+        (60 s doubling to 300 s). Quota exhaustion will not clear on a short
+        retry, so a quota 429 without ``Retry-After`` waits at least the maximum
+        backoff. The wait is sliced and visible via :meth:`get_throttle_state`.
         """
-        if retry_after is not None:
-            # Use Retry-After header value
-            wait_seconds = retry_after
-            logger.warning(
-                f"HTTP 429 received with Retry-After: {retry_after}s. "
-                f"Waiting {wait_seconds} seconds."
+        with self._lock:
+            is_quota = reason is not None and str(reason).upper() in (
+                'QUOTA', 'QUOTA_EXCEEDED'
             )
-        else:
-            # Use exponential backoff
-            wait_seconds = min(self.backoff_seconds, self.MAX_BACKOFF_SECONDS)
-            logger.warning(
-                f"HTTP 429 received. Using exponential backoff: {wait_seconds}s. "
-                f"(Next backoff will be {min(self.backoff_seconds * 2, self.MAX_BACKOFF_SECONDS)}s)"
-            )
-            
-            # Increase backoff for next time (exponential)
+            throttle_reason = self.REASON_QUOTA if is_quota else self.REASON_RATE
+
+            if retry_after is not None:
+                wait_seconds = max(0, int(retry_after))
+                logger.warning(
+                    f"HTTP 429 ({throttle_reason}) with Retry-After={retry_after}s; "
+                    f"waiting {wait_seconds}s"
+                )
+            else:
+                wait_seconds = min(self.backoff_seconds, self.MAX_BACKOFF_SECONDS)
+                if is_quota:
+                    wait_seconds = self.MAX_BACKOFF_SECONDS
+                logger.warning(
+                    f"HTTP 429 ({throttle_reason}); exponential backoff {wait_seconds}s "
+                    f"(next {min(self.backoff_seconds * 2, self.MAX_BACKOFF_SECONDS)}s)"
+                )
+            # Escalate for next time regardless of how this wait was sized.
             self.backoff_seconds = min(self.backoff_seconds * 2, self.MAX_BACKOFF_SECONDS)
-        
-        time.sleep(wait_seconds)
-    
+
+            until = self._now() + wait_seconds
+            self._set_throttle(throttle_reason, until)
+            self._wait(wait_seconds)
+            if self._now() >= until:
+                self._clear_throttle()
+            else:
+                self._save_state()
+
+    def handle_quota_exceeded(self, retry_after: Optional[int] = None) -> None:
+        """Convenience for a Spotify ``QUOTA_EXCEEDED`` 429."""
+        self.handle_429(retry_after=retry_after, reason=self.REASON_QUOTA)
+
     def reset_backoff(self) -> None:
-        """Reset the exponential backoff to its initial value.
-        
-        Call this method after successful API requests to reset the backoff
-        counter. This ensures that temporary rate limit issues don't cause
-        permanent slowdowns.
-        
-        Example:
-            >>> limiter = RateLimiter()
-            >>> response = api.make_request()
-            >>> if response.status_code == 200:
-            ...     limiter.reset_backoff()
-            >>> elif response.status_code == 429:
-            ...     limiter.handle_429()
-        """
-        if self.backoff_seconds > self.MIN_BACKOFF_SECONDS:
-            logger.debug(f"Resetting backoff from {self.backoff_seconds}s to {self.MIN_BACKOFF_SECONDS}s")
-        self.backoff_seconds = self.MIN_BACKOFF_SECONDS
-    
+        """Reset exponential backoff after a successful request."""
+        with self._lock:
+            if self.backoff_seconds != self.MIN_BACKOFF_SECONDS:
+                logger.debug(
+                    f"Resetting backoff from {self.backoff_seconds}s to {self.MIN_BACKOFF_SECONDS}s"
+                )
+                self.backoff_seconds = self.MIN_BACKOFF_SECONDS
+                self._save_state()
+
     def reset(self) -> None:
-        """Reset all rate limiting counters and state.
-        
-        Clears all tracking data:
-        - Resets daily operations to 0
-        - Updates last_reset to today
-        - Clears request_times deque
-        - Resets backoff to initial value
-        
-        This is primarily useful for testing or when switching API contexts.
-        
-        Warning:
-            Resetting counters may cause quota violations if called carelessly.
-            Use only when you're certain the slate should be wiped clean.
-        """
-        logger.info("Resetting all rate limiting counters")
-        self.daily_operations = 0
-        self.last_reset = date.today()
-        self.request_times.clear()
-        self.backoff_seconds = self.MIN_BACKOFF_SECONDS
-    
-    def get_remaining_daily_operations(self) -> int:
-        """Get the number of remaining operations for today.
-        
-        Returns:
-            int: Number of operations remaining before hitting daily limit.
-        """
-        self._reset_daily_counter()
-        return max(0, self.daily_limit - self.daily_operations)
-    
+        """Wipe all counters, backoff and throttle state (persisted too)."""
+        with self._lock:
+            logger.info("Resetting all rate limiting counters")
+            self.daily_operations = 0
+            self.last_reset = self._today()
+            self.request_times.clear()
+            self.last_request_at = None
+            self.backoff_seconds = self.MIN_BACKOFF_SECONDS
+            self._throttled_until = None
+            self._throttle_reason = None
+            self._throttle_message = ''
+            self._save_state()
+
+    # ------------------------------------------------------------------
+    # Introspection
+    # ------------------------------------------------------------------
+    def get_remaining_daily_operations(self) -> Optional[int]:
+        """Remaining requests under the daily ceiling, or ``None`` if unlimited."""
+        with self._lock:
+            self._roll_daily_counter()
+            if self.daily_limit is None:
+                return None
+            return max(0, self.daily_limit - self.daily_operations)
+
     def get_current_stats(self) -> dict:
-        """Get current rate limiting statistics.
-        
-        Returns:
-            dict: Dictionary containing current rate limiting stats:
-                - daily_operations: Current operation count
-                - daily_limit: Maximum daily operations
-                - remaining_operations: Operations remaining today
-                - requests_in_window: Number of requests in current minute window
-                - per_minute_limit: Maximum requests per minute
-                - backoff_seconds: Current backoff duration
-                - last_reset: Date of last daily counter reset
-        """
-        self._reset_daily_counter()
-        return {
-            "daily_operations": self.daily_operations,
-            "daily_limit": self.daily_limit,
-            "remaining_operations": self.get_remaining_daily_operations(),
-            "requests_in_window": len(self.request_times),
-            "per_minute_limit": self.per_minute_limit,
-            "backoff_seconds": self.backoff_seconds,
-            "last_reset": self.last_reset.isoformat()
-        }
-    
+        """Snapshot of counters, policy and throttle state."""
+        with self._lock:
+            self._roll_daily_counter()
+            throttle = self.get_throttle_state()
+            return {
+                "daily_operations": self.daily_operations,
+                "daily_limit": self.daily_limit,
+                "remaining_operations": self.get_remaining_daily_operations(),
+                "requests_in_window": len(self.request_times),
+                "per_minute_limit": self.per_minute_limit,
+                "min_interval": self.min_interval,
+                "jitter": self.jitter,
+                "backoff_seconds": self.backoff_seconds,
+                "last_reset": self.last_reset.isoformat(),
+                "last_request_at": self.last_request_at,
+                "persistent": self._conn is not None,
+                "throttled": throttle['throttled'],
+                "throttle_reason": throttle['reason'],
+                "throttled_until": throttle['until'],
+                "throttle_message": throttle['message'],
+            }
+
     def __repr__(self) -> str:
-        """Return string representation of the RateLimiter.
-        
-        Returns:
-            str: String representation with current stats.
-        """
+        daily = (
+            f"{self.daily_operations}/{self.daily_limit}"
+            if self.daily_limit is not None else f"{self.daily_operations}/-"
+        )
         return (
-            f"RateLimiter(daily={self.daily_operations}/{self.daily_limit}, "
+            f"RateLimiter(daily={daily}, "
             f"window={len(self.request_times)}/{self.per_minute_limit}, "
+            f"interval={self.min_interval}s+{self.jitter}s, "
             f"backoff={self.backoff_seconds}s)"
         )

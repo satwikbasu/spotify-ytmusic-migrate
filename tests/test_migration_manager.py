@@ -653,3 +653,120 @@ def test_resume_progress_wrapper_forwards_to_attached_callback(manager):
     manager.set_progress_callback(callback)
     wrapper(2, 2, 'Song', 1, 1)
     callback.assert_called_once_with('Resumed', 2, 2, 'Song', 1, 1)
+
+
+# ============================================================================
+# Test: rate-limit policy wiring and throttle visibility
+# ============================================================================
+
+def test_rate_limiter_constructed_with_sustained_rate_policy(
+    mock_spotify_client, mock_ytmusic_client, mock_cache_manager
+):
+    """The limiter gets a paced policy (no Data-API daily cap), persists to the
+    app DB, and reports throttle changes back to the manager."""
+    with patch('src.migrators.migration_manager.BackgroundWorker'), \
+         patch('src.migrators.migration_manager.PlaylistMigrator'), \
+         patch('src.migrators.migration_manager.YouTubeSearcher'), \
+         patch('src.migrators.migration_manager.TrackMatcher'), \
+         patch('src.migrators.migration_manager.SpotifyFetcher'), \
+         patch('src.migrators.migration_manager.Notifier'), \
+         patch('src.migrators.migration_manager.RateLimiter') as mock_limiter_cls:
+        mock_cache_manager.db_path = '/tmp/some/cache.db'
+        manager = MigrationManager(mock_spotify_client, mock_ytmusic_client, mock_cache_manager)
+
+    kwargs = mock_limiter_cls.call_args.kwargs
+    assert kwargs['daily_limit'] is None
+    assert kwargs['per_minute_limit'] == MigrationManager.RATE_PER_MINUTE_LIMIT
+    assert kwargs['min_interval'] == MigrationManager.RATE_MIN_INTERVAL_SECONDS
+    assert kwargs['jitter'] == MigrationManager.RATE_JITTER_SECONDS
+    assert kwargs['db_path'] == '/tmp/some/cache.db'
+    assert kwargs['on_throttle'] == manager._on_throttle_state_change
+    assert 15000 not in kwargs.values()
+
+
+def test_single_rate_limiter_shared_by_all_api_paths(
+    mock_spotify_client, mock_ytmusic_client, mock_cache_manager
+):
+    """Every API call path (fetcher, searcher, migrator) gets the same limiter."""
+    with patch('src.migrators.migration_manager.BackgroundWorker'), \
+         patch('src.migrators.migration_manager.PlaylistMigrator') as migrator_cls, \
+         patch('src.migrators.migration_manager.YouTubeSearcher') as searcher_cls, \
+         patch('src.migrators.migration_manager.TrackMatcher'), \
+         patch('src.migrators.migration_manager.SpotifyFetcher') as fetcher_cls, \
+         patch('src.migrators.migration_manager.Notifier'), \
+         patch('src.migrators.migration_manager.RateLimiter'):
+        manager = MigrationManager(mock_spotify_client, mock_ytmusic_client, mock_cache_manager)
+
+    assert searcher_cls.call_args.kwargs['rate_limiter'] is manager.rate_limiter
+    assert migrator_cls.call_args.kwargs['rate_limiter'] is manager.rate_limiter
+    assert fetcher_cls.call_args.kwargs['rate_limiter'] is manager.rate_limiter
+
+
+def test_real_rate_limiter_persists_in_cache_db(
+    mock_spotify_client, mock_ytmusic_client, tmp_path
+):
+    """With a real limiter, the manager's limiter writes its own table into the
+    same SQLite file CacheManager uses, without CacheManager's involvement."""
+    import sqlite3
+    cache = Mock()
+    cache.db_path = str(tmp_path / 'cache.db')
+    with patch('src.migrators.migration_manager.BackgroundWorker'), \
+         patch('src.migrators.migration_manager.PlaylistMigrator'), \
+         patch('src.migrators.migration_manager.YouTubeSearcher'), \
+         patch('src.migrators.migration_manager.TrackMatcher'), \
+         patch('src.migrators.migration_manager.SpotifyFetcher'), \
+         patch('src.migrators.migration_manager.Notifier'):
+        manager = MigrationManager(mock_spotify_client, mock_ytmusic_client, cache)
+        manager.rate_limiter.record_request()
+        manager.rate_limiter.close()
+
+    with sqlite3.connect(cache.db_path) as conn:
+        rows = dict(conn.execute("SELECT key, value FROM rate_limit_state").fetchall())
+    assert rows['daily_operations'] == '1'
+
+
+def test_get_throttle_state_delegates_to_limiter(manager):
+    state = {'throttled': True, 'reason': 'rate', 'until': 123.0, 'message': 'Rate limited - throttled until 00:02'}
+    manager.rate_limiter.get_throttle_state = Mock(return_value=state)
+    assert manager.get_throttle_state() == state
+
+
+def test_get_throttle_state_falls_back_to_last_reported(manager):
+    """If the limiter cannot answer, the last state it reported is returned."""
+    manager.rate_limiter.get_throttle_state = Mock(return_value=None)
+    assert manager.get_throttle_state() == {
+        'throttled': False, 'reason': None, 'until': None, 'message': ''
+    }
+    manager._on_throttle_state_change({'throttled': True, 'reason': 'quota', 'until': 5.0, 'message': 'q'})
+    assert manager.get_throttle_state()['reason'] == 'quota'
+
+
+def test_throttle_callback_forwarded_and_errors_contained(manager):
+    callback = Mock(side_effect=RuntimeError('ui broke'))
+    manager.set_throttle_callback(callback)
+    state = {'throttled': True, 'reason': 'rate', 'until': 1.0, 'message': 'm'}
+    manager._on_throttle_state_change(state)  # must not raise
+    callback.assert_called_once_with(state)
+    manager.set_throttle_callback(None)
+    manager._on_throttle_state_change({'throttled': False, 'reason': None, 'until': None, 'message': ''})
+    callback.assert_called_once()
+
+
+def test_migration_status_includes_throttle_state(manager):
+    manager.rate_limiter.get_throttle_state = Mock(return_value={
+        'throttled': True, 'reason': 'quota', 'until': 99.0, 'message': 'Quota exhausted - throttled until 00:01'
+    })
+    status = manager.get_migration_status()
+    assert status['throttle']['throttled'] is True
+    assert status['throttle']['reason'] == 'quota'
+
+
+def test_stop_closes_rate_limiter(manager):
+    manager.rate_limiter.close = Mock()
+    manager.stop()
+    manager.rate_limiter.close.assert_called_once()
+
+
+def test_stop_survives_rate_limiter_close_failure(manager):
+    manager.rate_limiter.close = Mock(side_effect=RuntimeError('db gone'))
+    manager.stop()  # must not raise
