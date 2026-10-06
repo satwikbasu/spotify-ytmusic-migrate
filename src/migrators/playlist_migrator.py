@@ -124,7 +124,8 @@ class PlaylistMigrator:
         tracks: List[Dict[str, Any]],
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
         resume_state: Optional[Dict[str, Any]] = None,
-        state_callback: Optional[Callable[..., None]] = None
+        state_callback: Optional[Callable[..., None]] = None,
+        playlist_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """Migrate a Spotify playlist to YouTube Music.
         
@@ -162,6 +163,10 @@ class PlaylistMigrator:
             state_callback: Optional callback invoked with keyword arguments
                 (youtube_playlist_ids, added_tracks, last_added_index,
                 matched_tracks, failed_tracks) after every durable write.
+            playlist_id: Optional Spotify source playlist id. Failed tracks are
+                persisted under it (``failed_tracks`` table) so they can be
+                listed after a restart. Falls back to the ``playlist_id`` the
+                cached tracks carry; without either nothing is persisted.
         
         Returns:
             Migration report dict with keys:
@@ -217,6 +222,29 @@ class PlaylistMigrator:
             )
         else:
             logger.info(f"Starting migration for playlist: {playlist_name} ({total_tracks} tracks)")
+        
+        # Where failed-track detail is persisted (None = not persisted)
+        failure_playlist_id = playlist_id or next(
+            (t.get('playlist_id') for t in tracks if t.get('playlist_id')), None
+        )
+        if failure_playlist_id and start_index == 0:
+            # A fresh run replaces any failures left by an earlier run
+            try:
+                self.cache_manager.clear_failed_tracks(failure_playlist_id)
+            except Exception as e:
+                logger.error(f"Could not reset failed-track records: {e}")
+        
+        def record_failure(track: Dict[str, Any], reason: str, source_index: int) -> None:
+            """Add to this run's report and persist the detail immediately."""
+            failed_tracks.append({'spotify_track': track, 'reason': reason})
+            if not failure_playlist_id:
+                return
+            try:
+                self.cache_manager.record_failed_track(
+                    failure_playlist_id, track, reason, source_index
+                )
+            except Exception as e:  # never fail the migration over bookkeeping
+                logger.error(f"Could not persist failed track '{track.get('name')}': {e}")
         
         # Per-run report data
         match_scores: List[float] = []
@@ -284,10 +312,11 @@ class PlaylistMigrator:
                         matched_count += 1
                         match_scores.append(item['confidence'])
                     else:
-                        failed_tracks.append({
-                            'spotify_track': item['track'],
-                            'reason': 'Failed to add to YouTube Music playlist'
-                        })
+                        record_failure(
+                            item['track'],
+                            'Failed to add to YouTube Music playlist',
+                            item['index']
+                        )
                 added_total += len(added_list)
             
             final_index = upto_index
@@ -308,16 +337,14 @@ class PlaylistMigrator:
                 logger.debug(f"[{idx}/{total_tracks}] _process_track returned: video_id={video_id}, confidence={confidence}")
                 
                 if video_id:
-                    pending.append({'track': spotify_track, 'video_id': video_id, 'confidence': confidence})
+                    pending.append({'track': spotify_track, 'video_id': video_id,
+                                    'confidence': confidence, 'index': idx})
                     logger.info(
                         f"[{idx}/{total_tracks}] Matched: {track_name} "
                         f"(confidence: {confidence:.1f}%)"
                     )
                 else:
-                    failed_tracks.append({
-                        'spotify_track': spotify_track,
-                        'reason': 'No match found above threshold'
-                    })
+                    record_failure(spotify_track, 'No match found above threshold', idx)
                     logger.warning(f"[{idx}/{total_tracks}] No match: {track_name}")
 
             except YouTubeAuthError:
@@ -333,10 +360,7 @@ class PlaylistMigrator:
                 raise
 
             except Exception as e:
-                failed_tracks.append({
-                    'spotify_track': spotify_track,
-                    'reason': f'Error: {str(e)}'
-                })
+                record_failure(spotify_track, f'Error: {str(e)}', idx)
                 logger.error(
                     f"[{idx}/{total_tracks}] EXCEPTION processing {track_name}: {type(e).__name__}: {e}",
                     exc_info=True

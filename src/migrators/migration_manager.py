@@ -14,6 +14,7 @@ Example:
 
 import logging
 import threading
+from datetime import datetime
 from typing import List, Dict, Any, Optional, Callable
 
 from spotipy import Spotify
@@ -617,7 +618,15 @@ class MigrationManager:
             incl. shards), ``all_done``, ``auth_required``, ``throttle`` and
             ``jobs`` (per-job dicts: ``job_id``, ``playlist_name``, ``status``,
             ``processed_tracks``, ``total_tracks``, ``matched_tracks``,
-            ``failed_tracks``, ``youtube_playlist_ids``, ``error_message``).
+            ``failed_tracks``, ``youtube_playlist_ids``, ``error_message``,
+            plus ``playlist_id``, ``created_at``, ``started_at``,
+            ``completed_at``), and ``started_at`` / ``finished_at`` /
+            ``duration_seconds`` for the whole batch. These come from the
+            persisted job rows (earliest ``created_at`` to latest
+            ``completed_at``, or to now while still running), so a job
+            resumed after a restart reports its true wall-clock span rather
+            than only this process's time. ``duration_seconds`` is None when
+            no job has a usable timestamp.
         """
         jobs: List[Dict[str, Any]] = []
         for job_id in job_ids or []:
@@ -631,6 +640,10 @@ class MigrationManager:
                 continue
             jobs.append({
                 'job_id': job_id,
+                'playlist_id': row.get('playlist_id') or '',
+                'created_at': row.get('created_at'),
+                'started_at': row.get('started_at'),
+                'completed_at': row.get('completed_at'),
                 'playlist_name': row.get('playlist_name') or '',
                 'status': row.get('status') or 'unknown',
                 'processed_tracks': int(row.get('progress') or 0),
@@ -650,7 +663,12 @@ class MigrationManager:
         all_done = len(jobs) > 0 and terminal == len(jobs)
         paused_auth = count(self.PAUSED_AUTH_STATUS)
 
+        started_at, finished_at, duration = self._batch_span(jobs, all_done)
+
         return {
+            'started_at': started_at,
+            'finished_at': finished_at,
+            'duration_seconds': duration,
             'total_jobs': len(jobs),
             'completed_jobs': completed,
             'failed_jobs': failed,
@@ -672,6 +690,85 @@ class MigrationManager:
             'throttle': self.get_throttle_state(),
             'jobs': jobs,
         }
+
+    @staticmethod
+    def _parse_ts(value: Any) -> Optional[datetime]:
+        """Parse a job-row timestamp (sqlite stores datetimes as text)."""
+        if isinstance(value, datetime):
+            return value
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
+
+    @classmethod
+    def _batch_span(cls, jobs: List[Dict[str, Any]], all_done: bool):
+        """(started_at, finished_at, seconds) for a batch of job dicts."""
+        starts = [t for t in (cls._parse_ts(j.get('created_at')) for j in jobs) if t]
+        if not starts:
+            return None, None, None
+        start = min(starts)
+        end = None
+        if all_done:
+            ends = [t for t in (cls._parse_ts(j.get('completed_at')) for j in jobs) if t]
+            end = max(ends) if ends else None
+        elapsed_to = end or datetime.now()
+        return start, end, max(0.0, (elapsed_to - start).total_seconds())
+
+    def get_active_job_ids(self) -> List[str]:
+        """Job ids that still have work to do: queued, in_progress or
+        paused_auth (read-only, from the job table).
+
+        Lets the progress screen track jobs that were re-queued at launch by
+        ``start()``, where no UI callback is attached.
+        """
+        return self.background_worker.get_active_job_ids()
+
+    def get_failed_tracks(
+        self,
+        playlist_id: Optional[str] = None,
+        job_ids: Optional[List[str]] = None
+    ) -> List[Dict[str, Any]]:
+        """Persisted failed tracks (name + reason), surviving resumes/restarts.
+
+        Args:
+            playlist_id: Only this source playlist.
+            job_ids: Only the playlists of these jobs. Ignored when
+                ``playlist_id`` is given. With neither, every failure.
+
+        Returns:
+            Dicts from ``CacheManager.get_failed_tracks`` plus ``playlist_name``
+            when it can be resolved from the job table.
+        """
+        names: Dict[str, str] = {}
+        try:
+            for job in self.background_worker.get_all_jobs(limit=1000):
+                names.setdefault(job.get('playlist_id'), job.get('playlist_name'))
+        except Exception as e:
+            logger.warning(f"Could not resolve playlist names for failures: {str(e)}")
+
+        if playlist_id:
+            wanted = [playlist_id]
+        elif job_ids:
+            wanted = []
+            for job_id in job_ids:
+                try:
+                    pid = self.background_worker.get_job_status(job_id).get('playlist_id')
+                except Exception:
+                    continue
+                if pid and pid not in wanted:
+                    wanted.append(pid)
+        else:
+            wanted = [None]
+
+        result: List[Dict[str, Any]] = []
+        for pid in wanted:
+            for item in self.cache_manager.get_failed_tracks(pid):
+                item['playlist_name'] = names.get(item['playlist_id']) or ''
+                result.append(item)
+        return result
 
     def reauthenticate_youtube(self, new_client: YTMusic) -> List[str]:
         """Swap in a refreshed YouTube Music client and resume auth-paused jobs.

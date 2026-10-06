@@ -502,6 +502,23 @@ class BackgroundWorker:
             except Exception as e:  # notifications are non-critical
                 logger.error(f"Auth-required notification failed: {str(e)}")
 
+    def get_active_job_ids(self) -> List[str]:
+        """Ids of jobs that still have work to do (queued, in_progress or
+        paused_auth), oldest first. Read-only, straight from the job table, so
+        it includes jobs re-queued at launch that no UI callback was attached to."""
+        placeholders = ', '.join('?' for _ in self.RESUMABLE_STATUSES)
+        try:
+            cursor = self.cache_manager.connection.cursor()
+            cursor.execute(f"""
+                SELECT job_id FROM migrations
+                WHERE status IN ({placeholders})
+                ORDER BY created_at ASC, rowid ASC
+            """, tuple(self.RESUMABLE_STATUSES))
+            return [row['job_id'] for row in cursor.fetchall()]
+        except sqlite3.Error as e:
+            logger.error(f"Failed to list active jobs: {str(e)}")
+            raise
+
     def get_auth_paused_jobs(self) -> List[Dict[str, Any]]:
         """Jobs currently parked as paused_auth (see get_all_jobs for the shape)."""
         return self.get_all_jobs(status=self.PAUSED_AUTH_STATUS, limit=1000)
@@ -617,6 +634,8 @@ class BackgroundWorker:
             kwargs['resume_state'] = job.get('resume_state')
         if 'state_callback' in params:
             kwargs['state_callback'] = state_callback
+        if 'playlist_id' in params:
+            kwargs['playlist_id'] = job.get('playlist_id')
         
         return func(job['playlist_name'], job['tracks'], progress_wrapper, **kwargs)
     
@@ -857,6 +876,7 @@ class BackgroundWorker:
                 - progress (int): Number of tracks processed
                 - total (int): Total number of tracks
                 - playlist_name (str): Playlist name
+                - playlist_id (str): Spotify source playlist id
                 - created_at (datetime): Job creation time
                 - started_at (Optional[datetime]): Job start time
                 - completed_at (Optional[datetime]): Job completion time
@@ -875,7 +895,7 @@ class BackgroundWorker:
             
             cursor.execute("""
                 SELECT status, processed_tracks, total_tracks, playlist_name,
-                       created_at, started_at, completed_at, error_message,
+                       playlist_id, created_at, started_at, completed_at, error_message,
                        youtube_playlist_ids, added_tracks, last_added_index,
                        matched_tracks, failed_tracks
                 FROM migrations
@@ -894,6 +914,7 @@ class BackgroundWorker:
                 'progress': row['processed_tracks'],
                 'total': row['total_tracks'],
                 'playlist_name': row['playlist_name'],
+                'playlist_id': row['playlist_id'],
                 'created_at': row['created_at'],
                 'started_at': row['started_at'],
                 'completed_at': row['completed_at'],
@@ -933,7 +954,8 @@ class BackgroundWorker:
             if status:
                 cursor.execute("""
                     SELECT job_id, status, processed_tracks, total_tracks, 
-                           playlist_name, created_at, started_at, completed_at, error_message
+                           playlist_name, created_at, started_at, completed_at, error_message,
+                           playlist_id
                     FROM migrations
                     WHERE status = ?
                     ORDER BY created_at DESC
@@ -942,7 +964,8 @@ class BackgroundWorker:
             else:
                 cursor.execute("""
                     SELECT job_id, status, processed_tracks, total_tracks,
-                           playlist_name, created_at, started_at, completed_at, error_message
+                           playlist_name, created_at, started_at, completed_at, error_message,
+                           playlist_id
                     FROM migrations
                     ORDER BY created_at DESC
                     LIMIT ?
@@ -952,7 +975,7 @@ class BackgroundWorker:
             
             jobs = []
             for row in rows:
-                job_id, status, progress, total, playlist_name, created_at, started_at, completed_at, error_message = row
+                job_id, status, progress, total, playlist_name, created_at, started_at, completed_at, error_message, playlist_id = row
                 
                 jobs.append({
                     'job_id': job_id,
@@ -963,7 +986,8 @@ class BackgroundWorker:
                     'created_at': created_at,
                     'started_at': started_at,
                     'completed_at': completed_at,
-                    'error_message': error_message
+                    'error_message': error_message,
+                    'playlist_id': playlist_id
                 })
             
             return jobs

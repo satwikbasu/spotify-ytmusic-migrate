@@ -50,6 +50,16 @@ class CacheManager:
             - youtube_video_id (TEXT): Matched YouTube video ID
             - confidence (REAL): Match confidence score (0.0-1.0)
             - matched_at (TIMESTAMP): When match was cached
+
+        failed_tracks (primary key: playlist_id + spotify_id):
+            - playlist_id (TEXT): Source Spotify playlist ID
+            - spotify_id (TEXT): Spotify track ID (``name:<title>`` if the
+              track had no id)
+            - name (TEXT): Track name
+            - artists (TEXT): JSON-encoded list of artist names
+            - reason (TEXT): Why the track could not be migrated
+            - position (INTEGER): 1-based index in the source playlist (0 = unknown)
+            - failed_at (TIMESTAMP): When the failure was recorded
     
     Attributes:
         db_path (str): Path to the SQLite database file.
@@ -145,6 +155,11 @@ class CacheManager:
                     )
                 """)
                 
+                # Per-track failure detail (owner decision, contract 4.6). Kept
+                # in its own table so it survives restarts/resumes and so the
+                # tracks-table key migration above is not disturbed.
+                self._ensure_failed_tracks_table(cursor)
+
                 # Create indexes for performance
                 cursor.execute("""
                     CREATE INDEX IF NOT EXISTS idx_tracks_spotify_id 
@@ -213,6 +228,129 @@ class CacheManager:
             FROM tracks_legacy
         """)
         cursor.execute("DROP TABLE tracks_legacy")
+
+    @staticmethod
+    def _ensure_failed_tracks_table(cursor: sqlite3.Cursor) -> None:
+        """Create the ``failed_tracks`` table if missing (idempotent).
+
+        A brand-new table, so there is nothing to convert on older databases:
+        every existing table and row is left untouched.
+        """
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS failed_tracks (
+                playlist_id TEXT NOT NULL,
+                spotify_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                artists TEXT NOT NULL DEFAULT '[]',
+                reason TEXT NOT NULL,
+                position INTEGER DEFAULT 0,
+                failed_at TIMESTAMP NOT NULL,
+                PRIMARY KEY (playlist_id, spotify_id)
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_failed_tracks_playlist_id
+            ON failed_tracks(playlist_id)
+        """)
+
+    def record_failed_track(
+        self,
+        playlist_id: str,
+        track: Dict[str, Any],
+        reason: str,
+        position: int = 0
+    ) -> None:
+        """Persist one failed track (upsert, so a re-run of the same track
+        after a resume replaces its row instead of duplicating it).
+
+        Args:
+            playlist_id: Source Spotify playlist ID.
+            track: Spotify track dict (``id``, ``name``, ``artists``).
+            reason: Human-readable failure reason.
+            position: 1-based index in the source playlist (0 if unknown).
+
+        Raises:
+            ValueError: If playlist_id is empty.
+            sqlite3.Error: If the database write fails.
+        """
+        if not playlist_id:
+            raise ValueError("Playlist ID is required")
+        name = track.get('name') or 'Unknown'
+        spotify_id = track.get('id') or f"name:{name}"
+        try:
+            with self.connection:
+                self.connection.execute("""
+                    INSERT INTO failed_tracks
+                        (playlist_id, spotify_id, name, artists, reason, position, failed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(playlist_id, spotify_id) DO UPDATE SET
+                        name = excluded.name,
+                        artists = excluded.artists,
+                        reason = excluded.reason,
+                        position = excluded.position,
+                        failed_at = excluded.failed_at
+                """, (
+                    playlist_id, spotify_id, name,
+                    json.dumps(track.get('artists') or []),
+                    reason or 'Unknown error', int(position or 0), datetime.now()
+                ))
+        except sqlite3.Error as e:
+            logger.error(f"Failed to record failed track: {str(e)}")
+            raise
+
+    def get_failed_tracks(self, playlist_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Failed tracks for one playlist (or all playlists when None).
+
+        Returns:
+            List of dicts: ``playlist_id``, ``spotify_id``, ``name``,
+            ``artists`` (list), ``artist`` (comma-joined), ``reason``,
+            ``position``, ``failed_at``; ordered by playlist then source position.
+        """
+        try:
+            cursor = self.connection.cursor()
+            sql = (
+                "SELECT playlist_id, spotify_id, name, artists, reason, position, failed_at "
+                "FROM failed_tracks"
+            )
+            params: tuple = ()
+            if playlist_id:
+                sql += " WHERE playlist_id = ?"
+                params = (playlist_id,)
+            sql += " ORDER BY playlist_id, position ASC, rowid ASC"
+            cursor.execute(sql, params)
+            result = []
+            for row in cursor.fetchall():
+                try:
+                    artists = json.loads(row['artists'])
+                except (TypeError, ValueError):
+                    artists = []
+                result.append({
+                    'playlist_id': row['playlist_id'],
+                    'spotify_id': row['spotify_id'],
+                    'name': row['name'],
+                    'artists': artists,
+                    'artist': ', '.join(str(a) for a in artists),
+                    'reason': row['reason'],
+                    'position': row['position'],
+                    'failed_at': row['failed_at'],
+                })
+            return result
+        except sqlite3.Error as e:
+            logger.error(f"Failed to read failed tracks: {str(e)}")
+            raise
+
+    def clear_failed_tracks(self, playlist_id: str) -> None:
+        """Forget recorded failures for a playlist (a fresh run starts clean)."""
+        if not playlist_id:
+            return
+        try:
+            with self.connection:
+                self.connection.execute(
+                    "DELETE FROM failed_tracks WHERE playlist_id = ?", (playlist_id,)
+                )
+        except sqlite3.Error as e:
+            logger.error(f"Failed to clear failed tracks: {str(e)}")
+            raise
 
     def cache_playlist(self, playlist: Dict[str, Any]) -> None:
         """Cache playlist metadata.
@@ -551,6 +689,7 @@ class CacheManager:
                 cursor = self.connection.cursor()
                 
                 cursor.execute("DELETE FROM match_cache")
+                cursor.execute("DELETE FROM failed_tracks")
                 cursor.execute("DELETE FROM tracks")
                 cursor.execute("DELETE FROM playlists")
                 

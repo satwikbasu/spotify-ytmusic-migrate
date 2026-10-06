@@ -18,12 +18,15 @@ import flet as ft
 import csv
 import webbrowser
 import os
+import logging
 from typing import Optional, Dict, Any, List
 from datetime import timedelta
 
 from src.ui.base_screen import BaseScreen
 from src.ui.components import AppButton
 from config import app_config
+
+logger = logging.getLogger(__name__)
 
 
 class ResultsScreen(BaseScreen):
@@ -96,9 +99,75 @@ class ResultsScreen(BaseScreen):
         # Get detailed playlist results (if available)
         self.results = self.app_state.get('playlist_results', [])
         
+        # Per-track failure detail and the true duration live in the database
+        # (they survive a resume/restart); read them through the manager.
+        self._load_persisted_failures()
+        self._apply_persisted_duration()
+        
         # File picker for CSV export
         self.file_picker: Optional[ft.FilePicker] = None
     
+    def _manager(self) -> Optional[Any]:
+        """The MigrationManager from app_state, if the screen has one."""
+        return self.app_state.get('migration_manager')
+
+    def _load_persisted_failures(self) -> None:
+        """Fill each playlist result's ``failed_tracks`` with the persisted rows.
+
+        Only results that report failures but carry no list are filled, so
+        detailed results handed in by a caller are never overwritten. Reads go
+        through ``MigrationManager.get_failed_tracks`` (never the worker). The
+        playlist is identified by ``playlist_id``, else resolved by name from
+        the manager's job table (newest job wins).
+        """
+        manager = self._manager()
+        if manager is None or not self.results:
+            return
+        ids_by_name: Dict[str, str] = {}
+        try:
+            for job in manager.get_all_jobs(limit=1000):
+                if job.get('playlist_id'):
+                    ids_by_name.setdefault(job.get('playlist_name'), job['playlist_id'])
+        except Exception as e:
+            logger.warning(f"Could not resolve playlists for failed tracks: {e}")
+        for result in self.results:
+            if result.get('failed_tracks') or not result.get('failed_count', 0):
+                continue
+            pid = result.get('playlist_id') or ids_by_name.get(result.get('name'))
+            if not pid:
+                continue
+            try:
+                rows = manager.get_failed_tracks(playlist_id=pid)
+            except Exception as e:
+                logger.warning(f"Could not load failed tracks for '{result.get('name')}': {e}")
+                continue
+            result['failed_tracks'] = [
+                {
+                    'id': row.get('spotify_id', ''),
+                    'spotify_id': row.get('spotify_id', ''),
+                    'name': row.get('name') or 'Unknown',
+                    'artist': row.get('artist') or 'Unknown',
+                    'failure_reason': row.get('reason') or 'Unknown error',
+                }
+                for row in rows
+            ]
+
+    def _apply_persisted_duration(self) -> None:
+        """Replace the per-process duration with the persisted job span when
+        the batch's job ids are known (``app_state['migration_job_ids']``), so a job that
+        was resumed across restarts shows its real "Took ..." time."""
+        manager = self._manager()
+        job_ids = self.app_state.get('migration_job_ids')
+        if manager is None or not job_ids:
+            return
+        try:
+            seconds = manager.get_batch_progress(list(job_ids)).get('duration_seconds')
+        except Exception as e:
+            logger.warning(f"Could not read persisted duration: {e}")
+            return
+        if isinstance(seconds, (int, float)) and seconds >= 0:
+            self.duration = seconds
+
     def build(self) -> ft.Control:
         """Build the results screen UI.
         
