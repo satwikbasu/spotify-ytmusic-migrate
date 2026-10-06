@@ -17,9 +17,16 @@ Example:
     $ python main.py
 """
 
+import sys
+
+# Native-messaging host mode: the browser spawns "<app> --native-host". Dispatch
+# BEFORE importing flet (or anything heavy) so the host starts in well under 1 s.
+if "--native-host" in sys.argv[1:]:
+    from src.capture.host import main as _native_host_main
+    sys.exit(_native_host_main())
+
 import flet as ft
 import logging
-import sys
 import os
 import threading
 from pathlib import Path
@@ -133,7 +140,19 @@ def initialize_app_state() -> dict:
         'migration_results': {},
         'playlist_results': [],
         'migration_job_ids': [],
+        'capture_hub': None,
     }
+
+    # Capture hub: lets the browser extension (via the native host) hand over
+    # the YouTube Music session. Failure must never block the app.
+    if not os.environ.get("PLAYLIST_MIGRATOR_NO_HUB"):
+        try:
+            from src.capture.hub import CaptureHub
+            hub = CaptureHub()
+            hub.start()
+            app_state['capture_hub'] = hub
+        except Exception as e:
+            logger.warning(f"Capture hub unavailable: {e}")
     
     logger.info("Application state initialized successfully")
     return app_state
@@ -156,6 +175,10 @@ def cleanup_app_state(app_state: dict) -> None:
     logger.info("Cleaning up application resources...")
     
     try:
+        hub = app_state.get('capture_hub')
+        if hub is not None:
+            hub.stop()
+
         # Stop migration manager if running
         if app_state.get('migration_manager'):
             logger.info("Stopping migration manager...")
@@ -520,7 +543,7 @@ def main(page: ft.Page) -> None:
         
         # Initialize application state
         app_state = initialize_app_state()
-        
+
         # Set up window event handler for cleanup / background survival.
         # prevent_close makes the OS close button raise a "close" event instead
         # of exiting, so an active migration can hide to the tray; when idle the
@@ -564,6 +587,14 @@ if __name__ == "__main__":
         # Ensure application directories exist
         logger.info("Ensuring application directories exist...")
         app_config.ensure_app_directories()
+
+        # Re-register the native-messaging host for every detected browser
+        # (a browser may have been installed after the app). Never fatal.
+        try:
+            from src.capture.registry import register_all
+            register_all()
+        except Exception as e:
+            logger.warning(f"Native host registration skipped: {e}")
         
         # Start the Flet application
         logger.info("Starting Flet application...")

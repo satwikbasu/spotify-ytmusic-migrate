@@ -14,6 +14,7 @@ from ytmusicapi import YTMusic
 
 from ..auth.spotify_auth import SpotifyAuthenticator
 from ..auth.youtube_auth import YouTubeAuthenticator
+from ..capture.session_store import SessionStore
 from ..utils.encryption import (
     ensure_master_key,
     encrypt_json_file,
@@ -120,6 +121,10 @@ class TokenManager:
             raise RuntimeError(f"Encryption key initialization failed: {str(e)}") from e
         
         self.tokens_dir = self.TOKENS_DIR
+
+        # Captured YouTube Music session (extension -> Native Messaging),
+        # Fernet-encrypted under ~/.playlist_migrator/credentials/.
+        self.youtube_session_store = SessionStore(key=self.encryption_key)
     
     def _get_encrypted_path(self, cache_name: str) -> str:
         """Get the path for an encrypted token file.
@@ -241,41 +246,23 @@ class TokenManager:
             logger.error(f"Spotify authentication failed: {str(e)}")
             raise RuntimeError(f"Spotify authentication failed: {str(e)}") from e
     
-    def authenticate_youtube(self) -> YTMusic:
-        """Authenticate with YouTube Music and encrypt the token.
-        
-        Performs the OAuth flow for YouTube Music authentication, then encrypts
-        the resulting token file for secure storage.
-        
-        Returns:
-            YTMusic: Authenticated YouTube Music client.
-            
+    def authenticate_youtube(self, rate_limiter=None) -> YTMusic:
+        """Return a client for the captured YouTube Music session.
+
+        There is no login flow here: the session arrives from the browser
+        extension via the capture hub. This only reloads a stored one.
+
         Raises:
-            RuntimeError: If authentication fails.
-            IOError: If token encryption fails.
+            RuntimeError: If no valid captured session exists yet.
         """
-        logger.info("Starting YouTube Music authentication")
-        
-        try:
-            # Perform authentication
-            yt_client = self.youtube_auth.authenticate()
-            logger.info("YouTube Music authentication successful")
-            
-            # Encrypt the credentials file
-            creds_path = self.youtube_auth.credentials_path
-            
-            if os.path.exists(creds_path):
-                self._encrypt_token_file(creds_path, self.YOUTUBE_CACHE_NAME)
-                logger.info("YouTube Music token encrypted and stored")
-            else:
-                logger.warning("YouTube credentials file not found after authentication")
-            
-            return yt_client
-            
-        except Exception as e:
-            logger.error(f"YouTube Music authentication failed: {str(e)}")
-            raise RuntimeError(f"YouTube Music authentication failed: {str(e)}") from e
-    
+        client = self.get_youtube_client(rate_limiter=rate_limiter)
+        if client is None:
+            raise RuntimeError(
+                "No YouTube Music session captured yet. Install the browser "
+                "extension and click Connect YouTube Music."
+            )
+        return client
+
     def get_spotify_client(self) -> Optional[spotipy.Spotify]:
         """Get an authenticated Spotify client from cached encrypted credentials.
         
@@ -327,47 +314,33 @@ class TokenManager:
             logger.error(f"Failed to load cached Spotify credentials: {str(e)}")
             return None
     
-    def get_youtube_client(self) -> Optional[YTMusic]:
-        """Get an authenticated YouTube Music client from cached encrypted credentials.
-        
-        Attempts to load and decrypt cached YouTube Music credentials, then creates
-        an authenticated client. Returns None if no valid credentials exist.
-        
-        Returns:
-            Optional[YTMusic]: Authenticated YouTube Music client, or None if
-                no valid cached credentials exist.
+    def get_youtube_client(self, rate_limiter=None, verify: bool = True) -> Optional[YTMusic]:
+        """Build a YTMusic client from the encrypted captured session.
+
+        Needs no Google credentials and no headers.json. With ``verify`` the
+        identity is confirmed with ``get_account_info()`` through the
+        ``RateLimiter`` (a signed-out session does not raise on library
+        calls). Returns None when nothing is stored or the session is dead.
         """
-        logger.debug("Attempting to load cached YouTube Music credentials")
-        
-        try:
-            # Check if encrypted token exists
-            if not self.is_youtube_authenticated():
-                logger.debug("No cached YouTube Music credentials found")
-                return None
-            
-            # Decrypt token to temporary location
-            temp_creds = self._decrypt_to_temp(self.YOUTUBE_CACHE_NAME)
-            
-            try:
-                # Create authenticated client
-                yt_client = YTMusic(auth=temp_creds)
-                
-                # Test the connection
-                yt_client.get_account_info()
-                logger.info("YouTube Music client created from cached credentials")
-                
-                return yt_client
-                
-            finally:
-                # Clean up temporary file
-                if os.path.exists(temp_creds):
-                    os.remove(temp_creds)
-                    logger.debug("Temporary YouTube credentials file removed")
-            
-        except Exception as e:
-            logger.error(f"Failed to load cached YouTube Music credentials: {str(e)}")
+        loaded = self.youtube_session_store.load()
+        if loaded is None:
+            logger.debug("No captured YouTube Music session stored")
             return None
-    
+        headers, _account = loaded
+        try:
+            client = YTMusic(auth=headers)
+            if verify:
+                from ..capture.verify import verify_identity
+                result = verify_identity(client, rate_limiter)
+                if not result.ok:
+                    logger.info(f"Stored YouTube session not usable ({result.code})")
+                    return None
+            logger.info("YouTube Music client created from captured session")
+            return client
+        except Exception as e:
+            logger.error(f"Failed to load captured YouTube session: {type(e).__name__}")
+            return None
+
     def is_spotify_authenticated(self) -> bool:
         """Check if encrypted Spotify credentials exist.
         
@@ -380,15 +353,8 @@ class TokenManager:
         return exists
     
     def is_youtube_authenticated(self) -> bool:
-        """Check if encrypted YouTube Music credentials exist.
-        
-        Returns:
-            bool: True if encrypted YouTube Music credentials exist, False otherwise.
-        """
-        encrypted_path = self._get_encrypted_path(self.YOUTUBE_CACHE_NAME)
-        exists = os.path.exists(encrypted_path)
-        logger.debug(f"YouTube Music authenticated: {exists}")
-        return exists
+        """True if an encrypted captured YouTube Music session exists."""
+        return self.youtube_session_store.exists()
     
     def clear_all_tokens(self) -> None:
         """Remove all cached tokens and encrypted files.
@@ -417,13 +383,7 @@ class TokenManager:
         
         # Clear YouTube Music tokens
         try:
-            youtube_enc = self._get_encrypted_path(self.YOUTUBE_CACHE_NAME)
-            if os.path.exists(youtube_enc):
-                os.remove(youtube_enc)
-                logger.info(f"Removed encrypted YouTube token: {youtube_enc}")
-            
-            # Also clear any unencrypted cache
-            self.youtube_auth.clear_cache()
+            self.youtube_session_store.clear()
             
         except Exception as e:
             logger.warning(f"Failed to clear YouTube Music tokens: {str(e)}")
@@ -457,12 +417,8 @@ class TokenManager:
         logger.info("Clearing YouTube Music token")
         
         try:
-            youtube_enc = self._get_encrypted_path(self.YOUTUBE_CACHE_NAME)
-            if os.path.exists(youtube_enc):
-                os.remove(youtube_enc)
-                logger.info("YouTube Music token cleared")
-            
-            self.youtube_auth.clear_cache()
+            self.youtube_session_store.clear()
+            logger.info("YouTube Music session cleared")
             
         except Exception as e:
             logger.error(f"Failed to clear YouTube Music token: {str(e)}")

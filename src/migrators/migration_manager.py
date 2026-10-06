@@ -206,6 +206,10 @@ class MigrationManager:
         # Error aggregation
         self._error_log: List[Dict[str, Any]] = []
         self._error_lock = threading.Lock()
+
+        # auth_required hook (silent re-capture before the user is bothered)
+        self._auth_required_handler: Optional[Callable[[str], bool]] = None
+        self._install_auth_notification_gate()
         
         logger.info("MigrationManager initialized successfully")
     
@@ -769,6 +773,64 @@ class MigrationManager:
                 item['playlist_name'] = names.get(item['playlist_id']) or ''
                 result.append(item)
         return result
+
+    def set_auth_required_handler(self, handler: Optional[Callable[[str], bool]]) -> None:
+        """Register ``handler(playlist_name) -> handled`` for ``auth_required``.
+
+        Fired once per outage (when the worker parks the first job as
+        ``paused_auth``), on its own daemon thread so the worker is never
+        blocked. The handler attempts a silent re-capture; if it returns True
+        the OS "reconnect" notification is suppressed, otherwise (False, or it
+        raised) the notification fires as before. With no handler nothing
+        changes. Pass None to clear.
+        """
+        self._auth_required_handler = handler
+
+    def _install_auth_notification_gate(self) -> None:
+        """Route the worker's per-outage notification through the handler.
+
+        BackgroundWorker calls ``notifier.notify_auth_required`` exactly once
+        per outage; wrapping it avoids editing the worker.
+        """
+        original = self.notifier.notify_auth_required
+
+        def gated(*args, **kwargs):
+            handler = self._auth_required_handler
+            if handler is None:
+                return original(*args, **kwargs)
+            name = kwargs.get('playlist_name') or (args[0] if args else '')
+
+            def run():
+                try:
+                    handled = bool(handler(name))
+                except Exception:
+                    logger.exception("auth_required handler failed")
+                    handled = False
+                if not handled:
+                    try:
+                        original(*args, **kwargs)
+                    except Exception:
+                        logger.exception("Auth-required notification failed")
+
+            threading.Thread(target=run, name="auth-required", daemon=True).start()
+
+        self.notifier.notify_auth_required = gated
+
+    def accept_captured_client(self, new_client: YTMusic) -> List[str]:
+        """Accept a freshly captured, already identity-verified client.
+
+        If jobs are parked as ``paused_auth`` this is
+        :meth:`reauthenticate_youtube` (swap + resume). Otherwise the client is
+        only swapped in (no spurious resume) and ``[]`` returned.
+        """
+        if new_client is None:
+            raise ValueError("new_client cannot be None")
+        if self.background_worker.is_auth_required():
+            return self.reauthenticate_youtube(new_client)
+        self.ytmusic_client = new_client
+        self.playlist_migrator.set_client(new_client)
+        self.youtube_searcher.set_client(new_client)
+        return []
 
     def reauthenticate_youtube(self, new_client: YTMusic) -> List[str]:
         """Swap in a refreshed YouTube Music client and resume auth-paused jobs.

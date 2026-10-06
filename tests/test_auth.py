@@ -445,36 +445,37 @@ def test_token_manager_treats_empty_youtube_creds_as_absent(temp_dir):
     assert manager.youtube_auth.client_secret is None
 
 
-def test_token_manager_authenticates_youtube_from_cookies_without_google_creds(temp_dir, tmp_path):
-    """Browser-cookie YouTube auth works with no YOUTUBE_CLIENT_ID/SECRET at all,
-    and the captured headers still go through the encrypted-at-rest path."""
+def test_token_manager_loads_captured_session_without_google_creds(temp_dir, tmp_path):
+    """The encrypted captured session yields a client with no Google creds and
+    no headers.json anywhere."""
+    from src.capture.session_store import SessionStore
     manager = _manager_without_google_creds(temp_dir)
-
-    headers = tmp_path / "headers.json"
-    headers.write_text('{"cookie": "x", "authorization": "SAPISIDHASH y"}', encoding="utf-8")
-    manager.youtube_auth.browser_headers_path = headers
-    # Point the "credentials file" the manager encrypts at a real temp file.
-    creds = tmp_path / "youtube_oauth.json"
-    creds.write_text('{"cookie": "x"}', encoding="utf-8")
-    manager.youtube_auth.credentials_path = creds
+    manager.youtube_session_store = SessionStore(
+        path=str(tmp_path / "youtube_session.enc"), key=manager.encryption_key)
+    manager.youtube_session_store.save({"cookie": "x", "authorization": "SAPISIDHASH y"}, "Tester")
+    assert manager.is_youtube_authenticated()
 
     signed_in = MagicMock()
     signed_in.get_account_info.return_value = {"accountName": "Tester"}
-    with patch("src.auth.youtube_auth.YTMusic", return_value=signed_in):
-        client = manager.authenticate_youtube()
+    limiter = MagicMock()
+    with patch("src.auth.token_manager.YTMusic", return_value=signed_in) as ctor:
+        client = manager.authenticate_youtube(rate_limiter=limiter)
 
     assert client is signed_in
-    assert os.path.exists(manager._get_encrypted_path(TokenManager.YOUTUBE_CACHE_NAME))
-    assert not creds.exists()  # plaintext removed after encryption
+    assert ctor.call_args.kwargs["auth"]["cookie"] == "x"
+    limiter.check_limit.assert_called_once()  # identity call goes through RateLimiter
+    manager.clear_youtube_token()
+    assert not manager.is_youtube_authenticated()
 
 
 def test_token_manager_without_google_creds_still_refuses_oauth(temp_dir, tmp_path):
     """Dropping the requirement must not revive the dead OAuth path."""
     manager = _manager_without_google_creds(temp_dir)
-    manager.youtube_auth.browser_headers_path = tmp_path / "absent.json"
-    manager.youtube_auth.browser_alt_path = tmp_path / "also-absent.json"
+    from src.capture.session_store import SessionStore
+    manager.youtube_session_store = SessionStore(
+        path=str(tmp_path / "absent.enc"), key=manager.encryption_key)
 
-    with pytest.raises(RuntimeError, match="(?i)browser"):
+    with pytest.raises(RuntimeError, match="(?i)extension"):
         manager.authenticate_youtube()
 
 
