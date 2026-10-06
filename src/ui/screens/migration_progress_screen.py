@@ -316,6 +316,12 @@ class MigrationProgressScreen(BaseScreen):
                 cache_manager=self.app_state['cache_manager']
             )
             
+            # Publish the manager so app-level services (background-survival
+            # window handling and OS sleep inhibition in main.py) can see that
+            # a migration is active. Without this, close-with-job and
+            # sleep-inhibition stay inert. See CONTEXT_CONTRACT §4.3.
+            self.app_state['migration_manager'] = self.migration_manager
+
             # Start background worker
             self.migration_manager.start()
             

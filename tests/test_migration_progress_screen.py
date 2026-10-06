@@ -552,3 +552,30 @@ class TestMigrationProgressScreenEdgeCases:
         
         # Should not raise exception
         screen._start_sync_animation()
+
+
+class TestMigrationProgressScreenAppStateWiring:
+    """The manager must be published to app_state so main.py's background
+    survival (close-with-job + sleep inhibition) can detect an active job.
+    See CONTEXT_CONTRACT §4.3."""
+
+    def test_start_migration_publishes_manager_to_app_state(self, screen, app_state):
+        import asyncio
+
+        assert app_state.get('migration_manager') is None
+
+        fake_manager = Mock()
+        fake_manager.migrate_playlists.return_value = ['job1']
+
+        with patch(
+            'src.ui.screens.migration_progress_screen.MigrationManager',
+            return_value=fake_manager,
+        ):
+            screen.show_loading = Mock()
+            screen.show_error = Mock()
+            asyncio.run(screen.start_migration())
+
+        # The exact instance the screen created is exposed under the key that
+        # is_migration_active() / SleepGuard read in main.py.
+        assert app_state['migration_manager'] is fake_manager
+        assert screen.migration_manager is fake_manager
