@@ -14,6 +14,13 @@ import pytest
 import flet as ft
 
 from src.ui.screens.settings_screen import SettingsScreen
+from config import app_config
+
+
+@pytest.fixture(autouse=True)
+def _isolated_user_config(tmp_path, monkeypatch):
+    """Reset also clears the saved Client ID; never touch the real home dir."""
+    monkeypatch.setattr(app_config, "APP_DATA_DIR", str(tmp_path))
 
 
 class TestSettingsScreenInitialization:

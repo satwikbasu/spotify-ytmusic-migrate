@@ -21,6 +21,26 @@ def mock_page():
     return page
 
 
+@pytest.fixture(autouse=True)
+def temp_home(tmp_path, monkeypatch):
+    """Redirect ~/.playlist_migrator to a temp dir so tests never touch the real one."""
+    monkeypatch.setattr(app_config, 'APP_DATA_DIR', str(tmp_path))
+    return tmp_path
+
+
+@pytest.fixture
+def saved_id():
+    """A Spotify Client ID the user already entered once."""
+    from src.utils import user_config
+    return user_config.set_spotify_client_id('a' * 32)
+
+
+def premium_client(product='premium', name='Sam'):
+    client = Mock(spec=spotipy.Spotify)
+    client.current_user.return_value = {'display_name': name, 'id': 'sam1', 'product': product}
+    return client
+
+
 @pytest.fixture
 def app_state():
     """Create a fresh app state."""
@@ -100,60 +120,35 @@ class TestWelcomeScreenBuild:
 
 
 class TestWelcomeScreenTokenManager:
-    """Test TokenManager initialization."""
-    
+    """TokenManager is built from the saved Spotify Client ID only."""
+
     @patch('src.ui.screens.welcome_screen.TokenManager')
-    def test_initialize_token_manager_success(self, mock_token_manager_class, welcome_screen):
-        """Test successful TokenManager initialization."""
-        # Set up config
-        with patch.object(app_config, 'SPOTIFY_CLIENT_ID', 'spotify_id'), \
-             patch.object(app_config, 'SPOTIFY_CLIENT_SECRET', 'spotify_secret'), \
-             patch.object(app_config, 'YOUTUBE_CLIENT_ID', 'youtube_id'), \
-             patch.object(app_config, 'YOUTUBE_CLIENT_SECRET', 'youtube_secret'):
-            
-            result = welcome_screen._initialize_token_manager()
-            
-            assert result is True
-            mock_token_manager_class.assert_called_once_with(
-                spotify_client_id='spotify_id',
-                spotify_client_secret='spotify_secret',
-                youtube_client_id='youtube_id',
-                youtube_client_secret='youtube_secret'
-            )
-    
-    def test_initialize_token_manager_missing_spotify_credentials(self, welcome_screen):
-        """Test TokenManager initialization with missing Spotify credentials."""
-        with patch.object(app_config, 'SPOTIFY_CLIENT_ID', ''), \
-             patch.object(app_config, 'SPOTIFY_CLIENT_SECRET', ''):
-            
-            result = welcome_screen._initialize_token_manager()
-            
-            assert result is False
-    
-    def test_initialize_token_manager_missing_youtube_credentials(self, welcome_screen):
-        """Test TokenManager initialization with missing YouTube credentials."""
-        with patch.object(app_config, 'SPOTIFY_CLIENT_ID', 'spotify_id'), \
-             patch.object(app_config, 'SPOTIFY_CLIENT_SECRET', 'spotify_secret'), \
-             patch.object(app_config, 'YOUTUBE_CLIENT_ID', ''), \
-             patch.object(app_config, 'YOUTUBE_CLIENT_SECRET', ''):
-            
-            result = welcome_screen._initialize_token_manager()
-            
-            assert result is False
-    
+    def test_initialize_token_manager_success(self, mock_tm_class, welcome_screen, saved_id):
+        assert welcome_screen._initialize_token_manager() is True
+        mock_tm_class.assert_called_once_with(spotify_client_id=saved_id)
+
     @patch('src.ui.screens.welcome_screen.TokenManager')
-    def test_initialize_token_manager_exception(self, mock_token_manager_class, welcome_screen):
-        """Test TokenManager initialization with exception."""
-        mock_token_manager_class.side_effect = Exception("Init error")
-        
-        with patch.object(app_config, 'SPOTIFY_CLIENT_ID', 'spotify_id'), \
-             patch.object(app_config, 'SPOTIFY_CLIENT_SECRET', 'spotify_secret'), \
-             patch.object(app_config, 'YOUTUBE_CLIENT_ID', 'youtube_id'), \
-             patch.object(app_config, 'YOUTUBE_CLIENT_SECRET', 'youtube_secret'):
-            
-            result = welcome_screen._initialize_token_manager()
-            
-            assert result is False
+    def test_no_google_credentials_required(self, mock_tm_class, welcome_screen, saved_id):
+        """Old gate aborted with 'Configuration Error' without YOUTUBE_CLIENT_ID."""
+        with patch.object(app_config, 'YOUTUBE_CLIENT_ID', ''), \
+             patch.object(app_config, 'YOUTUBE_CLIENT_SECRET', ''), \
+             patch.object(welcome_screen, 'show_error') as mock_error:
+            assert welcome_screen._initialize_token_manager() is True
+        mock_error.assert_not_called()
+
+    @patch('src.ui.screens.welcome_screen.TokenManager')
+    def test_no_saved_client_id_returns_false_quietly(self, mock_tm_class, welcome_screen):
+        with patch.object(welcome_screen, 'show_error') as mock_error:
+            assert welcome_screen._initialize_token_manager() is False
+        mock_error.assert_not_called()
+        mock_tm_class.assert_not_called()
+
+    @patch('src.ui.screens.welcome_screen.TokenManager')
+    def test_initialize_token_manager_exception(self, mock_tm_class, welcome_screen, saved_id):
+        mock_tm_class.side_effect = Exception("Init error")
+        with patch.object(welcome_screen, 'show_error') as mock_error:
+            assert welcome_screen._initialize_token_manager() is False
+        mock_error.assert_called_once()
 
 
 class TestWelcomeScreenCardState:
@@ -253,69 +248,52 @@ class TestWelcomeScreenContinueButton:
 
 
 class TestWelcomeScreenSpotifyConnect:
-    """Test Spotify connection flow."""
-    
+    """Spotify connection flow (saved Client ID -> PKCE -> /me)."""
+
     @patch('src.ui.screens.welcome_screen.TokenManager')
-    def test_spotify_connect_success(self, mock_token_manager_class, welcome_screen):
-        """Test successful Spotify connection."""
-        # Setup
+    def test_spotify_connect_success(self, mock_tm_class, welcome_screen, saved_id):
         welcome_screen.build()
-        mock_token_manager = Mock()
-        mock_spotify_client = Mock(spec=spotipy.Spotify)
-        mock_token_manager.authenticate_spotify.return_value = mock_spotify_client
-        mock_token_manager_class.return_value = mock_token_manager
-        
-        with patch.object(app_config, 'SPOTIFY_CLIENT_ID', 'spotify_id'), \
-             patch.object(app_config, 'SPOTIFY_CLIENT_SECRET', 'spotify_secret'), \
-             patch.object(app_config, 'YOUTUBE_CLIENT_ID', 'youtube_id'), \
-             patch.object(app_config, 'YOUTUBE_CLIENT_SECRET', 'youtube_secret'):
-            
-            welcome_screen.on_spotify_connect_click(None)
-        
+        tm = Mock()
+        client = premium_client()
+        tm.authenticate_spotify.return_value = client
+        mock_tm_class.return_value = tm
+
+        welcome_screen.on_spotify_connect_click(None)
+
         assert welcome_screen.spotify_authenticated is True
-        assert welcome_screen.spotify_client is mock_spotify_client
-        mock_token_manager.authenticate_spotify.assert_called_once()
-    
+        assert welcome_screen.spotify_client is client
+        assert welcome_screen.app_state['spotify_client'] is client
+        assert "Connected as Sam" in welcome_screen.spotify_status_text.value
+        tm.authenticate_spotify.assert_called_once()
+
     @patch('src.ui.screens.welcome_screen.TokenManager')
-    def test_spotify_connect_value_error(self, mock_token_manager_class, welcome_screen):
-        """Test Spotify connection with ValueError."""
+    def test_connect_error_shows_plain_message(self, mock_tm_class, welcome_screen, saved_id):
         welcome_screen.build()
-        mock_token_manager = Mock()
-        mock_token_manager.authenticate_spotify.side_effect = ValueError("Config error")
-        mock_token_manager_class.return_value = mock_token_manager
-        
-        with patch.object(app_config, 'SPOTIFY_CLIENT_ID', 'spotify_id'), \
-             patch.object(app_config, 'SPOTIFY_CLIENT_SECRET', 'spotify_secret'), \
-             patch.object(app_config, 'YOUTUBE_CLIENT_ID', 'youtube_id'), \
-             patch.object(app_config, 'YOUTUBE_CLIENT_SECRET', 'youtube_secret'):
-            
-            welcome_screen.on_spotify_connect_click(None)
-        
+        tm = Mock()
+        tm.authenticate_spotify.side_effect = RuntimeError("Auth failed")
+        mock_tm_class.return_value = tm
+
+        welcome_screen.on_spotify_connect_click(None)
+
         assert welcome_screen.spotify_authenticated is False
-    
-    @patch('src.ui.screens.welcome_screen.TokenManager')
-    def test_spotify_connect_runtime_error(self, mock_token_manager_class, welcome_screen):
-        """Test Spotify connection with RuntimeError."""
+        assert welcome_screen.spotify_error_kind == 'generic'
+        assert 'Traceback' not in welcome_screen.spotify_error_text.value
+        assert 'Auth failed' not in welcome_screen.spotify_error_text.value
+
+    def test_connect_without_client_id_opens_wizard(self, welcome_screen):
         welcome_screen.build()
-        mock_token_manager = Mock()
-        mock_token_manager.authenticate_spotify.side_effect = RuntimeError("Auth failed")
-        mock_token_manager_class.return_value = mock_token_manager
-        
-        with patch.object(app_config, 'SPOTIFY_CLIENT_ID', 'spotify_id'), \
-             patch.object(app_config, 'SPOTIFY_CLIENT_SECRET', 'spotify_secret'), \
-             patch.object(app_config, 'YOUTUBE_CLIENT_ID', 'youtube_id'), \
-             patch.object(app_config, 'YOUTUBE_CLIENT_SECRET', 'youtube_secret'):
-            
+        with patch.object(welcome_screen, '_open_url'), \
+             patch.object(welcome_screen, 'show_error') as mock_error:
             welcome_screen.on_spotify_connect_click(None)
-        
-        assert welcome_screen.spotify_authenticated is False
+        mock_error.assert_not_called()
+        assert welcome_screen.wizard_step == 'A0'
 
 
 class TestWelcomeScreenYouTubeConnect:
     """Test YouTube Music connection flow."""
     
     @patch('src.ui.screens.welcome_screen.TokenManager')
-    def test_youtube_connect_success(self, mock_token_manager_class, welcome_screen):
+    def test_youtube_connect_success(self, mock_token_manager_class, welcome_screen, saved_id):
         """Test successful YouTube connection."""
         welcome_screen.build()
         mock_token_manager = Mock()
@@ -335,7 +313,7 @@ class TestWelcomeScreenYouTubeConnect:
         mock_token_manager.authenticate_youtube.assert_called_once()
     
     @patch('src.ui.screens.welcome_screen.TokenManager')
-    def test_youtube_connect_error(self, mock_token_manager_class, welcome_screen):
+    def test_youtube_connect_error(self, mock_token_manager_class, welcome_screen, saved_id):
         """Test YouTube connection with error."""
         welcome_screen.build()
         mock_token_manager = Mock()
@@ -460,12 +438,12 @@ class TestWelcomeScreenIntegration:
     """Integration tests for WelcomeScreen."""
     
     @patch('src.ui.screens.welcome_screen.TokenManager')
-    def test_full_authentication_flow(self, mock_token_manager_class, welcome_screen):
+    def test_full_authentication_flow(self, mock_token_manager_class, welcome_screen, saved_id):
         """Test complete authentication flow for both services."""
         # Setup
         welcome_screen.build()
         mock_token_manager = Mock()
-        mock_spotify_client = Mock(spec=spotipy.Spotify)
+        mock_spotify_client = premium_client()
         mock_youtube_client = Mock(spec=YTMusic)
         mock_token_manager.authenticate_spotify.return_value = mock_spotify_client
         mock_token_manager.authenticate_youtube.return_value = mock_youtube_client
@@ -507,36 +485,16 @@ class TestWelcomeScreenIntegration:
 
 
 class TestWelcomeScreenErrorHandling:
-    """Test error handling in WelcomeScreen."""
-    
-    def test_missing_credentials_shows_error(self, welcome_screen):
-        """Test missing credentials shows error dialog."""
-        with patch.object(app_config, 'SPOTIFY_CLIENT_ID', ''), \
-             patch.object(app_config, 'SPOTIFY_CLIENT_SECRET', ''), \
-             patch.object(welcome_screen, 'show_error') as mock_error:
-            
-            result = welcome_screen._initialize_token_manager()
-            
-            assert result is False
-            mock_error.assert_called_once()
-            assert "Spotify" in mock_error.call_args[0][0]
-    
+    """Error handling in WelcomeScreen."""
+
     @patch('src.ui.screens.welcome_screen.TokenManager')
-    def test_authentication_exception_shows_error(self, mock_token_manager_class, welcome_screen):
-        """Test authentication exception shows error dialog."""
+    def test_unexpected_exception_shows_plain_message(self, mock_tm_class, welcome_screen, saved_id):
         welcome_screen.build()
-        mock_token_manager = Mock()
-        mock_token_manager.authenticate_spotify.side_effect = Exception("Unexpected error")
-        mock_token_manager_class.return_value = mock_token_manager
-        
-        with patch.object(app_config, 'SPOTIFY_CLIENT_ID', 'spotify_id'), \
-             patch.object(app_config, 'SPOTIFY_CLIENT_SECRET', 'spotify_secret'), \
-             patch.object(app_config, 'YOUTUBE_CLIENT_ID', 'youtube_id'), \
-             patch.object(app_config, 'YOUTUBE_CLIENT_SECRET', 'youtube_secret'), \
-             patch.object(welcome_screen, 'show_error') as mock_error:
-            
-            welcome_screen.on_spotify_connect_click(None)
-            
-            # Should show error
-            mock_error.assert_called()
-            assert "unexpected error" in mock_error.call_args[0][0].lower()
+        tm = Mock()
+        tm.authenticate_spotify.side_effect = Exception("boom")
+        mock_tm_class.return_value = tm
+
+        welcome_screen.on_spotify_connect_click(None)
+
+        assert welcome_screen.spotify_error_kind == 'generic'
+        assert "Something went wrong" in welcome_screen.spotify_error_text.value

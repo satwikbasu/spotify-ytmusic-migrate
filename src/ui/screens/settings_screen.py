@@ -540,6 +540,10 @@ class SettingsScreen(BaseScreen):
                         if hasattr(token_manager, 'clear_youtube_token'):
                             token_manager.clear_youtube_token()
                     
+                    # Forget the saved Spotify Client ID (user starts the wizard again)
+                    from src.utils import user_config
+                    user_config.clear()
+
                     # Reset settings to defaults
                     self.settings = self.DEFAULT_SETTINGS.copy()
                     try:
