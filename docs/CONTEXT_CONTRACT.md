@@ -77,14 +77,16 @@ publicly**. Therefore:
     impossible, validate the pasted Client ID (`^[0-9a-f]{32}$`, trimmed, green
     check), then an immediate `/me` test call with human-readable diagnosis
     (non-Premium vs. wrong redirect URI).
-- **Option B (FALLBACK, explicit "advanced / unofficial" opt-in): web-session
-  capture.** The same extension captures the live `open.spotify.com` Bearer
-  token **in-page** (observe the token the real web player already minted) — NOT
-  cookie + our own TOTP. This sidesteps Spotify's rotating TOTP secret. For
-  Free-tier users (blocked from A) and wizard abandoners. Higher ToS/legal risk
-  and brittle; gate it and label it honestly. Reuse the 401 re-capture flow.
-- Flow: Connect Spotify → detect Premium (`/me` `product`) → A wizard → on
-  no-Premium/abandon, offer B card.
+- **Option B (DEFERRED — do NOT build yet): web-session capture.** The same
+  extension would capture the live `open.spotify.com` Bearer token in-page.
+  **DECISION (owner):** defer Option B and ship Option A only for now, because
+  of extension-store-review risk and because the in-page capture is unverified
+  (needs local testing). For now, a Free-tier / no-Premium user gets a clear
+  "a Spotify Premium account is required right now; Free support is coming in a
+  future update" message — NOT a broken flow and NOT a dead end. Revisit B after
+  the web-token capture is tested locally. Keep the architecture open to it.
+- Flow: Connect Spotify → detect Premium (`/me` `product`) → A wizard. No-Premium
+  → the "Premium required for now" message (no B card yet).
 
 ### 4.3 Engine behaviour for a real 50k job
 - **Shard destination playlists at 5,000 items** (YouTube's hard playlist cap).
@@ -114,6 +116,19 @@ publicly**. Therefore:
   bug against the goal.
 - **Multi-playlist completion** must signal correctly (today completion math only
   works for a single playlist).
+
+### 4.6 Owner decisions (locked — build to these)
+- **Liked Songs:** a **toggle** controls whether Liked Songs is migrated as an
+  ordinary destination playlist named "Liked Songs" (sharded like any other) or
+  **skipped entirely**. Do NOT `rate_song` each track (that would halve
+  throughput). Default: include it (toggle on).
+- **Returning user with both accounts connected:** land on the **Connect screen
+  first** (both shown connected, prominent Continue), for reassurance — not
+  straight to Select.
+- **Failed tracks:** **persist per-track failure detail** (track name + reason)
+  in the DB so "View failed" and a saved report list the actual songs even after
+  a resume/restart — not counts only.
+- **Spotify Option B:** deferred (see §4.2). Ship Option A only for now.
 
 ### 4.4 Both GUI and CLI
 - `MigrationManager` is the facade. Add a `--cli` entry point beside the Flet GUI
